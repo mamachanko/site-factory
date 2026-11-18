@@ -56,18 +56,14 @@ Only `site/` is uploaded to Pages. Source guidance, tests, scripts, and workflow
    Do not grant unrelated permissions, account permissions, or a classic PAT.
 4. Create the App. Copy its **App ID** and generate a **private key**. Keep the downloaded PEM private.
 5. Under Install App, install it on **mamachanko**, choose **Only select repositories**, and select **site-factory**. If permissions are later changed, approve the updated installation permissions too.
-6. In **site-factory → Settings → Secrets and variables → Actions**, configure:
+6. In **site-factory → Settings → Environments**, create `site-factory-live`. Under **Deployment branches and tags**, choose **Selected branches and tags** and add a **Branch** rule for `main`. Then add an **Environment secret** named `SITE_FACTORY_APP_PRIVATE_KEY` with the entire PEM, including header/footer and line breaks. If upgrading an existing setup, remove the repository-level copy of the secret after setting up the restricted environment.
+7. In **site-factory → Settings → Secrets and variables → Actions → Variables**, add the App's numeric ID as the repository variable `SITE_FACTORY_APP_ID`.
 
-   | Kind | Name | Value |
-   | --- | --- | --- |
-   | Repository variable | `SITE_FACTORY_APP_ID` | The App's numeric ID |
-   | Repository secret | `SITE_FACTORY_APP_PRIVATE_KEY` | The entire PEM, including header/footer and line breaks |
+8. Enable GitHub Actions in site-factory. Keep the repository's default branch as **main** and make these files available on that branch before running the workflow. Allow the official `actions/*` used here under any Actions policy. The generated repositories also need Actions and Pages allowed by account policy.
 
-7. Enable GitHub Actions in site-factory. Keep the repository's default branch as **main** and make these files available on that branch before running the workflow. Allow the official `actions/*` used here under any Actions policy. The generated repositories also need Actions and Pages allowed by account policy.
+GitHub grants an App access to repositories it creates, even with a selected-repositories installation. The first token uses hardcoded `owner: mamachanko`, covers the installation, and requests only Administration write in addition to implicit Metadata read. After creation, a second `actions/create-github-app-token` step mints a fresh token scoped to the new repository with the permissions needed to populate and deploy it. Both tokens are short-lived and revoked by the action's default post-job cleanup.
 
-GitHub grants an App access to repositories it creates, even with a selected-repositories installation. The first token uses hardcoded `owner: mamachanko` and omits `repositories`, covering the installation so it can create a repository. After creation, a second `actions/create-github-app-token` step mints a fresh token scoped to the new repository. This avoids relying on the first token's original repository scope. Both tokens are short-lived and revoked by the action's default post-job cleanup.
-
-The workflow runs only from `main` in `mamachanko/site-factory`. Anyone allowed to change that trusted branch can change code that receives the App credentials: restrict write access and protect main as appropriate. PR CI uses read-only `GITHUB_TOKEN` permissions and receives no App key/token; it never uses `pull_request_target`. Generated repositories receive no factory secrets. Their deployment uses their own `GITHUB_TOKEN`, with only `pages: write` and `id-token: write` in the isolated deployment job; checking/uploading has `contents: read` and `pages: read` to read Pages metadata through configure-pages.
+The workflow runs only from `main` in `mamachanko/site-factory`. The plan job runs before live creation and can run without the environment configured. Only the live job uses `site-factory-live`. Restrict write access and protect `main` to control changes to code that receives the App credentials. PR CI uses a read-only `GITHUB_TOKEN` and receives no App credentials. Generated sites use their own `GITHUB_TOKEN`, with `pages: write` and `id-token: write` in the deployment job and `contents: read` and `pages: read` in the check-and-upload job.
 
 ## Verify domains before first use
 
@@ -79,7 +75,7 @@ Host: _github-pages-challenge-mamachanko
 Value: <the exact verification value supplied by GitHub>
 ```
 
-At Namecheap, choose the relevant domain → Manage → Advanced DNS → Host Records → Add New Record. Add GitHub's exact TXT host/value, return to GitHub, and click Verify. Keep the TXT record after verification. The value is account-specific; the factory cannot invent it. Verification of an apex also protects its immediate subdomains. For deeper hostnames, verify the relevant parent or exact domain as described in GitHub's domain verification guide.
+At Namecheap, choose the relevant domain → Manage → Advanced DNS → Host Records → Add New Record. Add GitHub's exact TXT host/value, return to GitHub, and click Verify. Keep the TXT record after verification. Before pointing DNS to Pages, confirm that the exact hostname or its immediate parent is verified in your personal Pages settings. For example, `maxbrauer.com` verification covers `games.maxbrauer.com`, and `word.games.maxbrauer.com` needs verification of `games.maxbrauer.com` or the exact hostname. Remove the Pages-pointing DNS record before retiring or detaching a site, and avoid wildcard records.
 
 If the domain uses third-party nameservers, edit records at the **authoritative DNS provider**, even if Namecheap is the registrar. The factory never contacts Namecheap or changes any DNS record.
 
@@ -171,7 +167,7 @@ Tests cover strict names/domains, DNS variants, escaped and single-pass substitu
 | Symptom | What to check / next step |
 | --- | --- |
 | Workflow is absent or skipped | Commit it to default `main`; dispatch on `main` in `mamachanko/site-factory`. Other branches/repos are intentionally skipped. |
-| App-token step fails | App ID variable, complete PEM secret, installation on the personal account, approved permissions, and selected repository access. Dry run skips these steps entirely. |
+| App-token step fails | App ID variable, complete PEM in the `site-factory-live` environment, installation on the personal account, approved permissions, and selected repository access. |
 | HTTP 401/403 | Token expiry, permissions, App installation, or account Actions/Pages policy. After a create succeeded, verify App access to the new repo before manual recovery. Do not substitute a classic PAT. |
 | Repository already exists / create HTTP 422 | Choose another name. A 404 preflight may hide an inaccessible private repo; GitHub's unique-name check still prevents replacement. Creation is never retried automatically. |
 | Git push fails | Confirm Contents and Workflows write, App access to the new repo, an empty remote, and account push rules. The factory never force-pushes. Inspect the repository before further work. |
@@ -186,7 +182,7 @@ If creation succeeded but a later step failed, rerunning the factory with that n
 
 ## Official references
 
-The implementation follows GitHub's current official guidance and uses current major action releases (checkout/setup-python/setup-node v7, create-github-app-token v3; configure-pages v5, upload-pages-artifact v4, deploy-pages v4):
+The workflows pin actions to full upstream commit SHAs. The comments beside each pin identify the major release line. Review the upstream release when updating a pin.
 
 - [Create a repository for the authenticated user](https://docs.github.com/en/rest/repos/repos#create-a-repository-for-the-authenticated-user) — installation-token support and Administration permission.
 - [Install your own GitHub App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app) — selected repositories and automatic access to App-created repositories.

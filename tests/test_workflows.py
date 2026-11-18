@@ -22,6 +22,8 @@ class WorkflowTests(unittest.TestCase):
                 for job in workflow['jobs'].values():
                     self.assertIn('runs-on', job)
                     for step in job['steps']:
+                        if action := step.get('uses'):
+                            self.assertRegex(action, r'^[^@]+@[a-f0-9]{40}$')
                         if step.get('uses', '').startswith('actions/checkout@'):
                             self.assertEqual(step['with']['persist-credentials'], 'false')
 
@@ -33,18 +35,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(inputs['repository_name']['required'], 'true')
         self.assertEqual(inputs['dry_run']['default'], 'true')
         self.assertEqual(inputs['dry_run']['type'], 'boolean')
-        self.assertIn("github.ref == 'refs/heads/main'", workflow['jobs']['create']['if'])
-        steps = workflow['jobs']['create']['steps']
+        plan = workflow['jobs']['plan']
+        create = workflow['jobs']['create']
+        self.assertIn("github.repository == 'mamachanko/site-factory'", plan['if'])
+        self.assertIn("github.ref == 'refs/heads/main'", plan['if'])
+        self.assertNotIn('environment', plan)
+        self.assertNotIn('secrets.', str(plan))
+        self.assertNotIn('create-github-app-token', str(plan))
+        self.assertEqual([step['run'] for step in plan['steps'] if 'run' in step], ['python3 scripts/factory.py plan'])
+        self.assertEqual(create['needs'], 'plan')
+        self.assertEqual(create['if'], '${{ !inputs.dry_run }}')
+        self.assertEqual(create['environment'], 'site-factory-live')
+        steps = create['steps']
         tokens = [step for step in steps if 'create-github-app-token' in step.get('uses', '')]
         self.assertEqual(len(tokens), 2)
         for token in tokens:
             self.assertEqual(token['with']['owner'], 'mamachanko')
-            self.assertEqual(token['if'], '${{ !inputs.dry_run }}')
             self.assertEqual(token['with']['app-id'], '${{ vars.SITE_FACTORY_APP_ID }}')
             self.assertEqual(token['with']['private-key'], '${{ secrets.SITE_FACTORY_APP_PRIVATE_KEY }}')
         self.assertNotIn('repositories', tokens[0]['with'])
-        self.assertIn('repositories', tokens[1]['with'])
-        for step in steps:
+        self.assertEqual(
+            {key: value for key, value in tokens[0]['with'].items() if key.startswith('permission-')},
+            {'permission-administration': 'write'},
+        )
+        self.assertEqual(tokens[1]['with']['repositories'], '${{ inputs.repository_name }}')
+        for step in plan['steps'] + steps:
             # User expressions belong in env/structured action inputs, never shell code.
             self.assertNotIn('${{ inputs.', step.get('run', ''))
 

@@ -27,48 +27,57 @@ concurrency:
   group: site-factory-create
   cancel-in-progress: false
 
+env:
+  REPOSITORY_NAME: ${{ inputs.repository_name }}
+  SITE_DESCRIPTION: ${{ inputs.description }}
+  CUSTOM_DOMAIN: ${{ inputs.custom_domain }}
+
 jobs:
-  create:
+  plan:
     if: github.repository == 'mamachanko/site-factory' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      REPOSITORY_NAME: ${{ inputs.repository_name }}
-      SITE_DESCRIPTION: ${{ inputs.description }}
-      CUSTOM_DOMAIN: ${{ inputs.custom_domain }}
-      FACTORY_STATE: site-factory-${{ github.run_id }}-${{ github.run_attempt }}.json
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.12'
       - name: Validate and describe the plan
         run: python3 scripts/factory.py plan
+
+  create:
+    needs: plan
+    if: ${{ !inputs.dry_run }}
+    environment: site-factory-live
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FACTORY_STATE: site-factory-${{ github.run_id }}-${{ github.run_attempt }}.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
       - name: Create installation token
-        if: ${{ !inputs.dry_run }}
         id: create-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
         with:
           app-id: ${{ vars.SITE_FACTORY_APP_ID }}
           private-key: ${{ secrets.SITE_FACTORY_APP_PRIVATE_KEY }}
           owner: mamachanko
           # Omit repositories so the token covers the installation, not just this repo.
           permission-administration: write
-          permission-contents: write
-          permission-workflows: write
-          permission-pages: write
-          permission-actions: write
       - name: Create a new public repository
-        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ steps.create-token.outputs.token }}
         run: python3 scripts/factory.py create --state "$RUNNER_TEMP/$FACTORY_STATE"
       - name: Refresh token after the App gains access to the new repository
-        if: ${{ !inputs.dry_run }}
         id: populate-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
         with:
           app-id: ${{ vars.SITE_FACTORY_APP_ID }}
           private-key: ${{ secrets.SITE_FACTORY_APP_PRIVATE_KEY }}
@@ -80,7 +89,6 @@ jobs:
           permission-pages: write
           permission-actions: write
       - name: Populate repository, configure Pages, and dispatch deployment
-        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ steps.populate-token.outputs.token }}
         run: python3 scripts/factory.py finish --state "$RUNNER_TEMP/$FACTORY_STATE"

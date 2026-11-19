@@ -1,7 +1,26 @@
-# Working on site-factory
+# Work on Site Factory
 
-Read README.md before changing authentication, repository initialization, DNS instructions, or workflows. Keep owner and domain restrictions in `scripts/factory.py`. Keep generated projects independent and buildless. Never create actual site repositories or modify DNS in tests.
+## Before you edit
 
-Run `python3 -m pip install -r requirements-dev.txt`, then `python3 -m unittest discover -s tests -v`, `python3 starter/scripts/check_site.py`, and `node --test starter/tests/*.test.mjs`. Use Python 3.12+ and Node.js 24+. The factory runtime uses only Python's standard library, Git, and gh. PyYAML is a test-only dependency. Read `starter/AGENTS.md` when editing starter files.
+- Read `README.md` before changing App authentication, initialization, DNS instructions, or workflows.
+- Read `starter/AGENTS.md` before editing the starter. Keep generated sites buildless and independent of the factory.
 
-The manual workflow runs only on main in mamachanko/site-factory. Never expose App keys/tokens in PR workflows. Preserve the credential-free plan, one target-scoped App token after successful planning, no-force pushes, and partial-failure reporting. Keep `initialize-site.yml` as the only manual entry point and `site-factory-live` restricted to main. Accept only empty targets or the exact raw/rendered starter from the same factory revision and inputs. Do not restore repository creation, owner-wide tokens, or local receipts. Do not automatically delete or overwrite repositories to recover from a failure.
+## Preserve the setup rules
+
+- Keep repository owner and domain validation in `scripts/factory.py`.
+- Keep `initialize-site.yml` as the manual entry point on `main` in `mamachanko/site-factory`. Restrict `site-factory-live` to `main` and keep App credentials out of pull request jobs.
+- Plan without credentials. After planning succeeds, mint one token scoped to the repository the owner created and granted to the App.
+- Accept only an empty repository or the exact raw or rendered starter from the matching factory revision. Use normal Git pushes. Report the stage where setup stops. Recover from Git and Pages state, and leave deletion or overwrite decisions to the repository owner.
+
+## Run the checks
+
+Use Python 3.12 or later and Node.js 24 or later. The factory uses the Python standard library, Git, and `gh`. PyYAML is for tests.
+
+```sh
+python3 -m pip install -r requirements-dev.txt
+python3 -m unittest discover -s tests -v
+python3 starter/scripts/check_site.py
+node --test starter/tests/*.test.mjs
+```
+
+Test with mocked GitHub responses and temporary local Git repositories. Keep live repositories and DNS out of tests.

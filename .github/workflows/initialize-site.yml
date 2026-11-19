@@ -1,10 +1,10 @@
-name: Create site
+name: Initialize site
 
 on:
   workflow_dispatch:
     inputs:
       repository_name:
-        description: Lowercase repository name (letters, digits, single hyphens; max 63)
+        description: Existing public mamachanko repository (lowercase letters, digits, single hyphens; max 63)
         required: true
         type: string
       description:
@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: site-factory-create
+  group: site-factory-initialize-${{ inputs.repository_name }}
   cancel-in-progress: false
 
 env:
@@ -47,14 +47,12 @@ jobs:
       - name: Validate and describe the plan
         run: python3 scripts/factory.py plan
 
-  create:
+  initialize:
     needs: plan
-    if: ${{ !inputs.dry_run }}
+    if: ${{ needs.plan.result == 'success' && !inputs.dry_run }}
     environment: site-factory-live
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      FACTORY_STATE: site-factory-${{ github.run_id }}-${{ github.run_attempt }}.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -62,21 +60,8 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.12'
-      - name: Create installation token
-        id: create-token
-        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
-        with:
-          app-id: ${{ vars.SITE_FACTORY_APP_ID }}
-          private-key: ${{ secrets.SITE_FACTORY_APP_PRIVATE_KEY }}
-          owner: mamachanko
-          # Omit repositories so the token covers the installation, not just this repo.
-          permission-administration: write
-      - name: Create a new public repository
-        env:
-          GH_TOKEN: ${{ steps.create-token.outputs.token }}
-        run: python3 scripts/factory.py create --state "$RUNNER_TEMP/$FACTORY_STATE"
-      - name: Refresh token after the App gains access to the new repository
-        id: populate-token
+      - name: Create target repository token
+        id: target-token
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
         with:
           app-id: ${{ vars.SITE_FACTORY_APP_ID }}
@@ -88,16 +73,16 @@ jobs:
           permission-workflows: write
           permission-pages: write
           permission-actions: write
-      - name: Populate repository, configure Pages, and dispatch deployment
+      - name: Initialize repository, configure Pages, and dispatch deployment
         env:
-          GH_TOKEN: ${{ steps.populate-token.outputs.token }}
-        run: python3 scripts/factory.py finish --state "$RUNNER_TEMP/$FACTORY_STATE"
+          GH_TOKEN: ${{ steps.target-token.outputs.token }}
+        run: python3 scripts/factory.py initialize
       - name: Report workflow-level failure
         if: failure()
         shell: bash
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
-          ## Creation workflow stopped
+          ## Initialization workflow stopped
 
-          Inspect the failed step and any repository created in this run. Token minting and checkout failures can happen outside the factory script. No automatic rollback occurs. Do not add DNS until Settings → Pages confirms the intended custom domain. Rerunning never overwrites an existing repository; see README troubleshooting.
+          Inspect the failed step and target repository. Token minting and checkout failures can happen outside the factory script. No automatic rollback occurs. Retry with the same factory revision and inputs after inspecting the target. Do not add DNS until Settings → Pages confirms the intended custom domain. See README troubleshooting.
           SUMMARY

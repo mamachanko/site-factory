@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Small, stdlib-only website factory. Credentials stay in the environment."""
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import html
 import http.client
 import json
@@ -65,7 +65,7 @@ class Site:
         return f"https://{self.domain}/" if self.domain else f"https://{OWNER}.github.io/{self.name}/"
 
 
-def render(site, source=ROOT / "starter"):
+def render(site, source=ROOT / "starter", *, raw=False):
     """Return the complete independent repository, without writing into a checkout."""
     values = {
         "__SITE_NAME__": site.name,
@@ -80,12 +80,12 @@ def render(site, source=ROOT / "starter"):
             relative = path.relative_to(source).as_posix()
             if any(part in {".git", "__pycache__", "node_modules"} for part in path.relative_to(source).parts):
                 raise FactoryError(f"Unexpected generated directory in starter: {relative}")
-            content = path.read_text(encoding="utf-8")
+            content = path.read_bytes().decode("utf-8")
             unknown = set(TOKEN.findall(content)) - values.keys()
             if unknown:
                 raise FactoryError(f"Unknown starter placeholder in {relative}.")
             # One substitution pass: user text cannot introduce another template expansion.
-            files[relative] = TOKEN.sub(lambda m: values[m.group()], content)
+            files[relative] = content if raw else TOKEN.sub(lambda m: values[m.group()], content)
     if "site/index.html" not in files or ".github/workflows/deploy.yml" not in files:
         raise FactoryError("Starter is incomplete.")
     return files
@@ -109,12 +109,12 @@ def dns_instructions(site):
 
 def plan(site, count):
     return (f"## Plan: {site.repository}\n\n"
-            f"1. Check that https://github.com/{site.repository} does not exist; abort if it does.\n"
-            "2. Create a public personal-account repository using an installation token.\n"
-            f"3. Refresh the token; push {count} rendered starter files in one initial commit on main.\n"
-            "4. Set main as default and enable Pages with build_type=workflow.\n"
-            f"5. {'Configure Pages custom domain: ' + site.domain if site.domain else 'Keep the default Pages domain'}.\n"
-            "6. Dispatch deploy.yml on main (bounded retries for registration).\n"
+            f"1. Inspect existing public personal-account repository https://github.com/{site.repository}.\n"
+            "2. Admit only an empty repository, the exact bundled starter on main, or its exact rendering.\n"
+            "3. Check Pages for conflicting source or domain settings before changing source.\n"
+            f"4. Furnish {count} rendered starter files on main, preserving template history; skip an exact rendering.\n"
+            "5. Set main as default and enable missing workflow Pages settings.\n"
+            f"6. Confirm {'Pages custom domain ' + site.domain if site.domain else 'the default Pages domain'} and dispatch deploy.yml.\n"
             f"7. Report the expected deployment URL: {site.url}\n\n"
             "### Planned manual DNS (only after successful Pages configuration)\n\n" + dns_instructions(site))
 
@@ -168,25 +168,46 @@ class GitHub:
             raise FactoryError(f"GitHub {method} {path} had a transport/response error; inspect GitHub before retrying mutations.") from None
 
 
-def create_repository(api, site):
+@dataclass(frozen=True)
+class TargetRepository:
+    id: int
+    default_branch: str
+
+
+def target_repository(api, site, repository_id=None):
+    repo = api.request("GET", f"/repos/{site.repository}")
+    if not isinstance(repo, dict) or not isinstance(repo.get("owner"), dict):
+        raise FactoryError("Target repository identity response is unsafe; refusing to continue.")
+    owner = repo["owner"]
+    if (type(repo.get("id")) is not int or repo["id"] <= 0
+            or (repository_id is not None and repo["id"] != repository_id)
+            or repo.get("full_name") != site.repository or repo.get("name") != site.name
+            or owner.get("login") != OWNER or owner.get("type") != "User"
+            or repo.get("private") is not False or repo.get("visibility") != "public"
+            or any(repo.get(key) is not False for key in ("archived", "disabled", "fork"))
+            or repo.get("mirror_url") is not None
+            or not isinstance(repo.get("default_branch"), str) or not repo["default_branch"]):
+        raise FactoryError("Target repository identity, visibility, or settings are unsafe; refusing to continue.")
+    return TargetRepository(repo["id"], repo["default_branch"])
+
+
+def pages_state(api, site):
     try:
-        api.request("GET", f"/repos/{site.repository}")
+        pages = api.request("GET", f"/repos/{site.repository}/pages")
     except APIError as error:
-        if error.status != 404:
-            raise
-    else:
-        raise FactoryError("Repository already exists; nothing was changed. Choose a new name.")
-    # Never retry creation: 404 can also mean an inaccessible existing private repository.
-    # GitHub's atomic name uniqueness check is the final guard against races/hidden repos.
-    repo = api.request("POST", "/user/repos", {"name": site.name, "description": site.description,
-        "private": False, "auto_init": False, "has_wiki": False, "has_projects": False})
-    if repo.get("full_name") != site.repository or repo.get("private") is not False:
-        raise FactoryError("Created repository identity/visibility mismatch; inspect GitHub before proceeding.")
-    return repo["id"]
+        if error.status == 404:
+            return None
+        raise
+    if (not isinstance(pages, dict) or pages.get("build_type") != "workflow"
+            or pages.get("cname") not in (None, "", site.domain)):
+        raise FactoryError("Pages source or custom domain conflicts with this initialization; nothing will be replaced.")
+    return pages
 
 
-def seed_repository(site, files):
-    """Push without tokens in arguments, remotes, files, or captured diagnostics."""
+def initialize_repository(api, site, files, *, progress=lambda x: None):
+    """Admit exact starter objects, then converge source and missing Pages settings."""
+    target = target_repository(api, site)
+    base = f"/repos/{site.repository}"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "GH_"))}
     env.update(GH_TOKEN=os.environ.get("GH_TOKEN", ""), GH_HOST="github.com",
                GH_PROMPT_DISABLED="1", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
@@ -194,30 +215,101 @@ def seed_repository(site, files):
                GIT_AUTHOR_EMAIL="site-factory@users.noreply.github.com",
                GIT_COMMITTER_NAME="site-factory", GIT_COMMITTER_EMAIL="site-factory@users.noreply.github.com")
     with tempfile.TemporaryDirectory(prefix="site-factory-") as directory:
-        root = Path(directory)
-        for relative, content in files.items():
-            path = root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
-        def git(*args):
+        def git(*args, content=None):
             try:
-                return subprocess.run(["git", *args], cwd=root, env=env, check=True,
-                    capture_output=True, text=True, timeout=90).stdout
+                return subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull,
+                    "-c", "core.fsmonitor=false", "-c", "credential.helper=",
+                    "-c", "credential.helper=!gh auth git-credential", *args],
+                    cwd=directory, env=env, input=content, check=True,
+                    capture_output=True, text=True, encoding="utf-8", timeout=90).stdout.strip()
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                raise FactoryError("Git initialization/push failed; inspect the new repository and App permissions. No force push was attempted.") from None
-        git("init", "--initial-branch=main")
-        git("add", ".")
-        git("-c", "commit.gpgsign=false", "commit", "-m", "Initialize website [skip ci]")
+                raise FactoryError("Git inspection/initialization/push failed; inspect the target and App permissions. No force push was attempted.") from None
+
+        git("init", "--template=", "--initial-branch=main")
         git("remote", "add", "origin", f"https://github.com/{site.repository}.git")
-        auth = ("-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential")
-        if git(*auth, "ls-remote", "origin").strip():
-            raise FactoryError("New repository is no longer empty; refusing to populate it.")
-        git(*auth, "push", "origin", "main:refs/heads/main")
+
+        def refs():
+            output = git("ls-remote", "--refs", "origin")
+            if not output:
+                return {}
+            result = {}
+            for line in output.splitlines():
+                fields = line.split("\t")
+                if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0]) or fields[1] != "refs/heads/main":
+                    raise FactoryError("Target has unsupported refs; only main or a repository with no refs is admissible.")
+                result[fields[1]] = fields[0]
+            return result
+
+        def tree(contents):
+            git("read-tree", "--empty")
+            for name, content in contents.items():
+                mode = "100755" if (ROOT / "starter" / name).stat().st_mode & 0o111 else "100644"
+                blob = git("hash-object", "-w", "--stdin", content=content)
+                git("update-index", "--add", "--cacheinfo", f"{mode},{blob},{name}")
+            return git("write-tree")
+
+        rendered_tree = tree(files)
+        raw_tree = tree(render(site, raw=True))
+        expected_refs = refs()
+        parent = expected_refs.get("refs/heads/main")
+        current_tree = None
+        if parent:
+            git("fetch", "--no-tags", "origin", parent)
+            current_tree = git("rev-parse", parent + "^{tree}")
+            if current_tree not in (raw_tree, rendered_tree):
+                raise FactoryError("Target main is not the exact bundled or rendered starter; refusing to overwrite source.")
+            if current_tree == raw_tree and target.default_branch != "main":
+                raise FactoryError("A template target must use main as its default branch.")
+        expected_default = target.default_branch
+
+        def guard(*, allow_main=False):
+            nonlocal expected_default
+            current = target_repository(api, site, target.id)
+            allowed_defaults = (expected_default, "main") if allow_main else (expected_default,)
+            if current.default_branch not in allowed_defaults or refs() != expected_refs:
+                raise FactoryError("Target identity, default branch, or main changed during initialization; refusing to continue.")
+            expected_default = current.default_branch
+            return pages_state(api, site)
+
+        if current_tree != rendered_tree:
+            guard()
+            args = ("commit-tree", rendered_tree, "-p", parent) if parent else ("commit-tree", rendered_tree)
+            commit = git(*args, content="Initialize website [skip ci]\n")
+            git("push", "origin", commit + ":refs/heads/main")
+            expected_refs = {"refs/heads/main": commit}
+            progress("Rendered starter pushed to main")
+        else:
+            progress("Exact rendered starter already on main")
+        pages = guard(allow_main=parent is None)
+        if expected_default != "main":
+            api.request("PATCH", base, {"default_branch": "main"})
+            expected_default = "main"
+            progress("Default branch set to main")
+            pages = guard()
+        if pages is None:
+            api.request("POST", base + "/pages", {"build_type": "workflow"})
+            progress("Pages enabled")
+        pages = guard()
+        if pages is None:
+            raise FactoryError("Pages configuration was not confirmed; do not change DNS.")
+        if site.domain and not pages.get("cname"):
+            api.request("PUT", base + "/pages", {"cname": site.domain, "build_type": "workflow"})
+            progress("Pages custom domain set")
+
+        def confirm():
+            pages = guard()
+            if pages is None or (pages.get("cname") or "") != site.domain:
+                raise FactoryError("Pages custom-domain configuration was not confirmed; do not change DNS.")
+            progress("Pages source and domain confirmed")
+
+        dispatch(api, site, check=confirm)
+        progress("Initial deployment dispatched")
 
 
-def dispatch(api, site, sleep=time.sleep, attempts=8):
+def dispatch(api, site, sleep=time.sleep, attempts=8, check=lambda: None):
     path = f"/repos/{site.repository}/actions/workflows/deploy.yml/dispatches"
     for attempt in range(attempts):
+        check()
         try:
             api.request("POST", path, {"ref": "main"})
             return
@@ -225,26 +317,6 @@ def dispatch(api, site, sleep=time.sleep, attempts=8):
             if error.status not in (404, 422) or attempt == attempts - 1:
                 raise
             sleep(min(2 ** attempt, 15))
-
-
-def finish_repository(api, site, repository_id, files, seed=seed_repository, progress=lambda x: None):
-    base = f"/repos/{site.repository}"
-    repo = api.request("GET", base)
-    if repo.get("id") != repository_id or repo.get("full_name") != site.repository or repo.get("private") is not False:
-        raise FactoryError("New repository identity/visibility changed; refusing to continue.")
-    seed(site, files)
-    progress("Initial commit pushed to main")
-    api.request("PATCH", base, {"default_branch": "main"})
-    api.request("POST", base + "/pages", {"build_type": "workflow"})
-    progress("Pages enabled")
-    if site.domain:
-        api.request("PUT", base + "/pages", {"cname": site.domain, "build_type": "workflow"})
-        pages = api.request("GET", base + "/pages")
-        if pages.get("cname") != site.domain or pages.get("build_type") != "workflow":
-            raise FactoryError("Pages custom-domain configuration was not confirmed; do not change DNS.")
-        progress("Pages custom domain confirmed")
-    dispatch(api, site)
-    progress("Initial deployment dispatched")
 
 
 def report(message):
@@ -256,47 +328,32 @@ def report(message):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("plan", "create", "finish"), nargs="?", default="plan")
-    parser.add_argument("--state", type=Path, help="Runner-local receipt; contains no credentials")
+    parser.add_argument("phase", choices=("plan", "initialize"), nargs="?", default="plan")
     args = parser.parse_args(argv)
     stage = "Validation"
     try:
         site = Site(os.environ.get("REPOSITORY_NAME", ""), os.environ.get("SITE_DESCRIPTION", ""), os.environ.get("CUSTOM_DOMAIN", ""))
         files = render(site)
         if args.phase == "plan":
-            report("**DRY RUN — no GitHub requests, credentials, or mutations. Repository availability is not checked.**\n\n" + plan(site, len(files)))
+            report("**DRY RUN — no GitHub requests, credentials, or mutations. Target repository and Pages settings are not checked.**\n\n" + plan(site, len(files)))
             return 0
-        if not args.state:
-            raise FactoryError("Live phases require --state.")
         api = GitHub()
-        if args.phase == "create":
-            stage = "Repository creation (inspect GitHub if the result is uncertain)"
-            # Reserve receipt before any mutation; never reuse a previous attempt.
-            with args.state.open("x", encoding="utf-8") as receipt:
-                repo_id = create_repository(api, site)
-                json.dump({"site": asdict(site), "repository_id": repo_id}, receipt)
-            report(f"Created https://github.com/{site.repository}. Next: refresh the App token and populate it.")
-        else:
-            stage = "Loading creation receipt"
-            state = json.loads(args.state.read_text(encoding="utf-8"))
-            if state["site"] != asdict(site):
-                raise FactoryError("Creation receipt does not match the requested site.")
-            stage = "Populating the newly created repository"
-            def progress(message):
-                nonlocal stage
-                stage = message + "; next operation"
-                report(message + ".")
-            finish_repository(api, site, state["repository_id"], files, progress=progress)
-            report(f"## Site created\n\nRepository: https://github.com/{site.repository}\n\n"
-                   f"Expected deployment URL: {site.url}\n\n"
-                   f"Deployment queued; follow https://github.com/{site.repository}/actions/workflows/deploy.yml . "
-                   "This factory does not wait for deployment success or DNS/TLS readiness.\n\n" + dns_instructions(site))
+        stage = "Inspecting the existing target repository"
+        def progress(message):
+            nonlocal stage
+            stage = message + "; next operation"
+            report(message + ".")
+        initialize_repository(api, site, files, progress=progress)
+        report(f"## Site initialized\n\nRepository: https://github.com/{site.repository}\n\n"
+               f"Expected deployment URL: {site.url}\n\n"
+               f"Deployment queued; follow https://github.com/{site.repository}/actions/workflows/deploy.yml . "
+               "This factory does not wait for deployment success or DNS/TLS readiness.\n\n" + dns_instructions(site))
         return 0
     except (FactoryError, OSError, ValueError, KeyError) as error:
         # OSError/JSON details may include local data; keep them out of CI logs.
         detail = str(error) if isinstance(error, FactoryError) else "Local state or file operation failed."
         report(f"## Factory failed\n\nStage: {stage}. {detail}\n\n"
-               "No automatic rollback or overwrite is performed. Inspect any newly created repository and its Pages settings. "
+               "No automatic rollback or overwrite is performed. Inspect the target repository and its Pages settings. Rerun with the same inputs and factory revision after resolving the failure. "
                "Do not add DNS until the Pages custom domain is confirmed. See README troubleshooting.")
         return 1
 

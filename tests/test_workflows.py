@@ -27,8 +27,8 @@ class WorkflowTests(unittest.TestCase):
                         if step.get('uses', '').startswith('actions/checkout@'):
                             self.assertEqual(step['with']['persist-credentials'], 'false')
 
-    def test_creation_is_manual_main_only_with_boolean_dry_run(self):
-        workflow = load(ROOT / '.github/workflows/create-site.yml')
+    def test_initialization_is_manual_main_only_with_boolean_dry_run(self):
+        workflow = load(ROOT / '.github/workflows/initialize-site.yml')
         self.assertEqual(list(workflow['on']), ['workflow_dispatch'])
         inputs = workflow['on']['workflow_dispatch']['inputs']
         self.assertEqual(set(inputs), {'repository_name', 'description', 'custom_domain', 'dry_run'})
@@ -36,29 +36,39 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(inputs['dry_run']['default'], 'true')
         self.assertEqual(inputs['dry_run']['type'], 'boolean')
         plan = workflow['jobs']['plan']
-        create = workflow['jobs']['create']
+        initialize = workflow['jobs']['initialize']
         self.assertIn("github.repository == 'mamachanko/site-factory'", plan['if'])
         self.assertIn("github.ref == 'refs/heads/main'", plan['if'])
         self.assertNotIn('environment', plan)
         self.assertNotIn('secrets.', str(plan))
         self.assertNotIn('create-github-app-token', str(plan))
         self.assertEqual([step['run'] for step in plan['steps'] if 'run' in step], ['python3 scripts/factory.py plan'])
-        self.assertEqual(create['needs'], 'plan')
-        self.assertEqual(create['if'], '${{ !inputs.dry_run }}')
-        self.assertEqual(create['environment'], 'site-factory-live')
-        steps = create['steps']
+        self.assertEqual(initialize['needs'], 'plan')
+        self.assertEqual(initialize['if'], "${{ needs.plan.result == 'success' && !inputs.dry_run }}")
+        self.assertEqual(initialize['environment'], 'site-factory-live')
+        steps = initialize['steps']
         tokens = [step for step in steps if 'create-github-app-token' in step.get('uses', '')]
-        self.assertEqual(len(tokens), 2)
+        self.assertEqual(len(tokens), 1)
         for token in tokens:
             self.assertEqual(token['with']['owner'], 'mamachanko')
             self.assertEqual(token['with']['app-id'], '${{ vars.SITE_FACTORY_APP_ID }}')
             self.assertEqual(token['with']['private-key'], '${{ secrets.SITE_FACTORY_APP_PRIVATE_KEY }}')
-        self.assertNotIn('repositories', tokens[0]['with'])
+        self.assertEqual(tokens[0]['with']['repositories'], '${{ inputs.repository_name }}')
         self.assertEqual(
             {key: value for key, value in tokens[0]['with'].items() if key.startswith('permission-')},
-            {'permission-administration': 'write'},
+            {f'permission-{name}': 'write' for name in ('administration', 'contents', 'workflows', 'pages', 'actions')},
         )
-        self.assertEqual(tokens[1]['with']['repositories'], '${{ inputs.repository_name }}')
+        self.assertEqual(workflow['name'], 'Initialize site')
+        self.assertEqual(workflow['concurrency'], {
+            'group': 'site-factory-initialize-${{ inputs.repository_name }}',
+            'cancel-in-progress': 'false',
+        })
+        run_steps = [step for step in steps if 'run' in step and step.get('if') != 'failure()']
+        self.assertEqual([step['run'] for step in run_steps], ['python3 scripts/factory.py initialize'])
+        self.assertEqual(run_steps[0]['env']['GH_TOKEN'], '${{ steps.target-token.outputs.token }}')
+        self.assertNotIn('FACTORY_STATE', str(workflow))
+        self.assertNotIn('--state', str(workflow))
+        self.assertFalse((ROOT / '.github/workflows/create-site.yml').exists())
         for step in plan['steps'] + steps:
             # User expressions belong in env/structured action inputs, never shell code.
             self.assertNotIn('${{ inputs.', step.get('run', ''))

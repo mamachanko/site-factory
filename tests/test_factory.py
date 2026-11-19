@@ -13,8 +13,8 @@ import urllib.error
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from factory import (APIError, FactoryError, GitHub, Site, create_repository, dispatch,
-                     dns_instructions, finish_repository, main, render, seed_repository)
+from factory import (APIError, FactoryError, GitHub, Site, dispatch,
+                     dns_instructions, main, render)
 
 
 class ValidationTests(unittest.TestCase):
@@ -121,75 +121,6 @@ class GenerationTests(unittest.TestCase):
 
 
 class GitHubTests(unittest.TestCase):
-    def test_create_public_repository_after_404(self):
-        api = Mock()
-        api.request.side_effect = [APIError('GET', '/repos/mamachanko/puzzles', 404),
-                                   {'id': 42, 'full_name': 'mamachanko/puzzles', 'private': False}]
-        self.assertEqual(create_repository(api, Site('puzzles', 'Games')), 42)
-        method, path, payload = api.request.call_args.args
-        self.assertEqual((method, path), ('POST', '/user/repos'))
-        self.assertEqual(payload['private'], False)
-        self.assertEqual(payload['auto_init'], False)
-
-    def test_existing_repository_is_never_modified(self):
-        api = Mock()
-        api.request.return_value = {'id': 42}
-        with self.assertRaisesRegex(FactoryError, 'already exists'):
-            create_repository(api, Site('puzzles'))
-        self.assertEqual(api.request.call_count, 1)
-
-    def test_preflight_permission_or_server_errors_abort(self):
-        for status in (401, 403, 429, 500):
-            api = Mock()
-            api.request.side_effect = APIError('GET', '/repos/mamachanko/puzzles', status)
-            with self.subTest(status=status), self.assertRaises(APIError):
-                create_repository(api, Site('puzzles'))
-            self.assertEqual(api.request.call_count, 1)
-
-    def test_creation_race_or_hidden_existing_repository_is_not_retried(self):
-        api = Mock()
-        api.request.side_effect = [APIError('GET', '/repos/mamachanko/puzzles', 404), APIError('POST', '/user/repos', 422)]
-        with self.assertRaises(APIError):
-            create_repository(api, Site('puzzles'))
-        self.assertEqual(api.request.call_count, 2)
-
-    def test_finish_configures_domain_before_dispatch(self):
-        api = Mock()
-        api.request.side_effect = [
-            {'id': 42, 'full_name': 'mamachanko/puzzles', 'private': False}, None, {}, None,
-            {'cname': 'puzzles.mamachanko.com', 'build_type': 'workflow'}, None]
-        seed = Mock()
-        finish_repository(api, Site('puzzles', domain='puzzles.mamachanko.com'), 42, {}, seed=seed)
-        seed.assert_called_once()
-        calls = [call.args for call in api.request.call_args_list]
-        self.assertEqual(calls[2], ('POST', '/repos/mamachanko/puzzles/pages', {'build_type': 'workflow'}))
-        self.assertEqual(calls[3][2]['cname'], 'puzzles.mamachanko.com')
-        self.assertTrue(calls[-1][1].endswith('/deploy.yml/dispatches'))
-
-    def test_default_domain_does_not_set_cname(self):
-        api = Mock()
-        api.request.side_effect = [{'id': 42, 'full_name': 'mamachanko/puzzles', 'private': False}, None, {}, None]
-        finish_repository(api, Site('puzzles'), 42, {}, seed=Mock())
-        self.assertFalse(any(call.args[0] == 'PUT' for call in api.request.call_args_list))
-
-    def test_receipt_identity_mismatch_never_pushes(self):
-        api = Mock()
-        api.request.return_value = {'id': 43, 'full_name': 'mamachanko/puzzles', 'private': False}
-        seed = Mock()
-        with self.assertRaisesRegex(FactoryError, 'identity'):
-            finish_repository(api, Site('puzzles'), 42, {}, seed=seed)
-        seed.assert_not_called()
-
-    def test_pages_domain_failure_never_dispatches(self):
-        for response in (APIError('PUT', '/pages', 422), {'cname': None, 'build_type': 'workflow'}):
-            api = Mock()
-            api.request.side_effect = [{'id': 42, 'full_name': 'mamachanko/puzzles', 'private': False},
-                                       None, {}, response] if isinstance(response, APIError) else [
-                                           {'id': 42, 'full_name': 'mamachanko/puzzles', 'private': False}, None, {}, None, response]
-            with self.assertRaises(FactoryError):
-                finish_repository(api, Site('puzzles', domain='puzzles.mamachanko.com'), 42, {}, seed=Mock())
-            self.assertFalse(any('dispatches' in call.args[1] for call in api.request.call_args_list))
-
     def test_dispatch_retries_registration_delays_and_stops(self):
         api, sleep = Mock(), Mock()
         api.request.side_effect = [APIError('POST', '/dispatches', 404), APIError('POST', '/dispatches', 422), None]
@@ -219,32 +150,6 @@ class GitHubTests(unittest.TestCase):
             self.assertEqual(request.full_url, 'https://api.github.com/user/repos')
             self.assertEqual(request.get_header('X-github-api-version'), '2026-03-10')
 
-    def test_git_seed_pushes_single_main_commit_without_credentials_in_remote(self):
-        original_run = subprocess.run
-        with tempfile.TemporaryDirectory() as directory:
-            bare = Path(directory) / 'remote.git'
-            original_run(['git', 'init', '--bare', str(bare)], check=True, capture_output=True)
-            calls = []
-            def run(command, **kwargs):
-                calls.append((command, kwargs.get('env', {})))
-                # Redirect the only remote to a local bare repo; no network calls.
-                if command[:4] == ['git', 'remote', 'add', 'origin']:
-                    command = [*command[:4], str(bare)]
-                return original_run(command, **kwargs)
-            with patch.dict(os.environ, {'GH_TOKEN': 'secret-test-token', 'GIT_TRACE': '1'}), patch('factory.subprocess.run', side_effect=run):
-                seed_repository(Site('puzzles'), render(Site('puzzles')))
-            count = original_run(['git', '--git-dir', str(bare), 'rev-list', '--count', 'main'], capture_output=True, text=True, check=True)
-            self.assertEqual(count.stdout.strip(), '1')
-            tree = original_run(['git', '--git-dir', str(bare), 'ls-tree', '-r', '--name-only', 'main'], capture_output=True, text=True, check=True)
-            self.assertIn('.github/workflows/deploy.yml', tree.stdout)
-            for command, env in calls:
-                self.assertNotIn('secret-test-token', ' '.join(command))
-                self.assertNotIn('GIT_TRACE', env)
-                self.assertNotIn('--force', command)
-            # A second attempt must refuse the populated remote.
-            with patch('factory.subprocess.run', side_effect=run), self.assertRaisesRegex(FactoryError, 'no longer empty'):
-                seed_repository(Site('puzzles'), render(Site('puzzles')))
-
 
 class CLITests(unittest.TestCase):
     def run_cli(self, args, env):
@@ -258,53 +163,38 @@ class CLITests(unittest.TestCase):
             result, output = self.run_cli([], {'REPOSITORY_NAME': 'puzzles', 'CUSTOM_DOMAIN': 'puzzles.mamachanko.com'})
         self.assertEqual(result, 0)
         self.assertIn('DRY RUN', output)
-        self.assertIn('Repository availability is not checked', output)
+        self.assertIn('Target repository and Pages settings are not checked', output)
         self.assertIn('| CNAME | puzzles | mamachanko.github.io |', output)
         api.assert_not_called()
         run.assert_not_called()
 
+    def test_retired_phases_and_receipts_are_not_cli_options(self):
+        for args in (['create'], ['finish'], ['initialize', '--state', '/unused']):
+            with self.subTest(args=args), patch('factory.GitHub') as api, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    main(args)
+                self.assertEqual(caught.exception.code, 2)
+                api.assert_not_called()
+
     def test_invalid_input_fails_before_credentials(self):
         with patch('factory.GitHub') as api:
-            result, output = self.run_cli(['create', '--state', '/unused'], {'REPOSITORY_NAME': '../oops'})
+            result, output = self.run_cli(['initialize'], {'REPOSITORY_NAME': '../oops'})
         self.assertEqual(result, 1)
         self.assertIn('Validation', output)
         api.assert_not_called()
-
-    def test_create_receipt_contains_identity_without_credentials(self):
-        with tempfile.TemporaryDirectory() as directory, patch('factory.GitHub') as github:
-            path = Path(directory) / 'state.json'
-            github.return_value.request.side_effect = [APIError('GET', '/repo', 404),
-                {'id': 42, 'full_name': 'mamachanko/puzzles', 'private': False}]
-            result, _ = self.run_cli(['create', '--state', str(path)], {'REPOSITORY_NAME': 'puzzles', 'GH_TOKEN': 'secret'})
-            self.assertEqual(result, 0)
-            self.assertEqual(json.loads(path.read_text())['repository_id'], 42)
-            self.assertNotIn('secret', path.read_text())
-            github.return_value.reset_mock()
-            result, _ = self.run_cli(['create', '--state', str(path)], {'REPOSITORY_NAME': 'puzzles'})
-            self.assertEqual(result, 1)
-            github.return_value.request.assert_not_called()
-
-    def test_mismatched_receipt_refuses_finish(self):
-        with tempfile.TemporaryDirectory() as directory, patch('factory.GitHub') as github:
-            path = Path(directory) / 'state.json'
-            path.write_text(json.dumps({'site': {'name': 'other'}, 'repository_id': 42}))
-            result, output = self.run_cli(['finish', '--state', str(path)], {'REPOSITORY_NAME': 'puzzles'})
-            self.assertEqual(result, 1)
-            self.assertIn('does not match', output)
-            github.return_value.request.assert_not_called()
 
     def test_failure_is_nonzero_and_written_to_summary_without_secrets(self):
         with tempfile.TemporaryDirectory() as directory, patch('factory.GitHub') as github:
             summary = Path(directory) / 'summary.md'
             github.return_value.request.side_effect = APIError('GET', '/repos/mamachanko/puzzles', 403)
-            result, output = self.run_cli(['create', '--state', str(Path(directory) / 'state.json')],
+            result, output = self.run_cli(['initialize'],
                 {'REPOSITORY_NAME': 'puzzles', 'GITHUB_STEP_SUMMARY': str(summary), 'GH_TOKEN': 'secret'})
             self.assertEqual(result, 1)
             self.assertIn('HTTP 403', summary.read_text())
             self.assertIn('No automatic rollback', output)
             self.assertNotIn('secret', output)
 
-    def test_create_http_failure_reports_only_safe_diagnostics(self):
+    def test_initialize_http_failure_reports_only_safe_diagnostics(self):
         request_id = 'CFF6:2A1BFD:91E587C:DB831B4:6AFEE42D'
         cases = (
             (403, {}, {'message': 'Resource not accessible by integration'}, 'access denied'),
@@ -334,40 +224,39 @@ class CLITests(unittest.TestCase):
                     body = json.dumps({**body, 'private': 'secret-test-token'} if isinstance(body, dict) else body).encode()
                 failure = urllib.error.HTTPError('https://api.github.com/user/repos', status,
                     'secret-test-token', response_headers, io.BytesIO(body))
-                self.assert_create_http_failure(failure, category, request_id)
+                self.assert_initialize_http_failure(failure, category, request_id)
 
-    def test_create_http_failure_rejects_unsafe_request_ids_and_preserves_unreadable_status(self):
+    def test_initialize_http_failure_rejects_unsafe_request_ids_and_preserves_unreadable_status(self):
         for request_id in ('secret-test-token', 'ABCD:123456:ABCDEF:123456:ABCDEF12\nsecret-test-token',
                            '<script>secret-test-token</script>', 'ABCD1234', 'A:B:C:D:E:F', 'A:' + 'B' * 200):
             with self.subTest(request_id=request_id):
                 failure = urllib.error.HTTPError('https://api.github.com/user/repos', 403, 'secret-test-token',
                     {'X-GitHub-Request-Id': request_id}, io.BytesIO(b'{"message":"Rate Limit Exceeded"}'))
-                self.assert_create_http_failure(failure, 'rate limited', None)
+                self.assert_initialize_http_failure(failure, 'rate limited', None)
         unreadable = Mock()
         unreadable.read.side_effect = OSError('secret-test-token')
         failure = urllib.error.HTTPError('https://api.github.com/user/repos', 403, 'secret-test-token',
             {'X-RateLimit-Remaining': '0'}, unreadable)
-        self.assert_create_http_failure(failure, 'rate limited', None)
+        self.assert_initialize_http_failure(failure, 'rate limited', None)
         deeply_nested = io.BytesIO(b'[' * 16000 + b']' * 16000)
         request_id = 'CFF6:2A1BFD:91E587C:DB831B4:6AFEE42D'
         failure = urllib.error.HTTPError('https://api.github.com/user/repos', 403, 'secret-test-token',
             {'X-GitHub-Request-Id': request_id}, deeply_nested)
-        self.assert_create_http_failure(failure, None, request_id)
+        self.assert_initialize_http_failure(failure, None, request_id)
 
-    def assert_create_http_failure(self, failure, category, request_id):
+    def assert_initialize_http_failure(self, failure, category, request_id):
         with tempfile.TemporaryDirectory() as directory, patch('factory.urllib.request.build_opener') as build_opener:
             opener = build_opener.return_value
-            opener.open.side_effect = [urllib.error.HTTPError('https://api.github.com/repos/mamachanko/puzzles',
-                404, 'secret-test-token', {}, io.BytesIO(b'{}')), failure]
+            opener.open.side_effect = failure
             summary = Path(directory) / 'summary.md'
-            result, output = self.run_cli(['create', '--state', str(Path(directory) / 'state.json')],
+            result, output = self.run_cli(['initialize'],
                 {'REPOSITORY_NAME': 'puzzles', 'GITHUB_STEP_SUMMARY': str(summary), 'GH_TOKEN': 'secret-test-token'})
             self.assertEqual(result, 1)
-            self.assertEqual(opener.open.call_count, 2)
-            self.assertEqual([call.args[0].method for call in opener.open.call_args_list], ['GET', 'POST'])
-            self.assertEqual(opener.open.call_args.args[0].full_url, 'https://api.github.com/user/repos')
+            self.assertEqual(opener.open.call_count, 1)
+            self.assertEqual([call.args[0].method for call in opener.open.call_args_list], ['GET'])
+            self.assertEqual(opener.open.call_args.args[0].full_url, 'https://api.github.com/repos/mamachanko/puzzles')
             for report in (output, summary.read_text()):
-                self.assertIn(f'GitHub POST /user/repos failed (HTTP {failure.code}).', report)
+                self.assertIn(f'GitHub GET /repos/mamachanko/puzzles failed (HTTP {failure.code}).', report)
                 if category:
                     self.assertIn(f'Category: {category}.', report)
                 else:
@@ -379,6 +268,381 @@ class CLITests(unittest.TestCase):
                 for unsafe in ('secret-test-token', 'private unknown message', '<script>',
                                'X-Private-Header', 'Bearer', '192.0.2.1'):
                     self.assertNotIn(unsafe, report)
+
+
+class InitializationTests(unittest.TestCase):
+    run_cli = CLITests.run_cli
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.bare = self.root / 'remote.git'
+        self.real_run = subprocess.run
+        self.real_run(['git', 'init', '--bare', str(self.bare)], check=True, capture_output=True)
+        self.repo = {'id': 42, 'name': 'puzzles', 'full_name': 'mamachanko/puzzles',
+                     'owner': {'login': 'mamachanko', 'type': 'User'}, 'private': False,
+                     'visibility': 'public', 'archived': False, 'disabled': False,
+                     'fork': False, 'mirror_url': None, 'default_branch': 'main'}
+        self.pages = None
+        self.calls = []
+        self.git_calls = []
+        self.before_git = lambda command: None
+        self.before_request = lambda method, path, payload: None
+        self.after_request = lambda method, path, payload: None
+        self.api = Mock()
+        self.api.request.side_effect = self.request
+
+    def request(self, method, path, payload=None):
+        self.calls.append((method, path, payload))
+        self.before_request(method, path, payload)
+        if path.endswith('/pages'):
+            if method == 'GET':
+                if self.pages is None:
+                    raise APIError(method, path, 404)
+                result = dict(self.pages)
+            elif method == 'POST':
+                self.pages = {'build_type': payload['build_type'], 'cname': None}
+                result = dict(self.pages)
+            elif method == 'PUT':
+                self.pages.update(payload)
+                result = None
+            else:
+                self.fail((method, path, payload))
+        elif path.endswith('/dispatches'):
+            self.assertEqual((method, payload), ('POST', {'ref': 'main'}))
+            result = None
+        elif path == '/repos/mamachanko/puzzles':
+            if method == 'PATCH':
+                self.repo.update(payload)
+            else:
+                self.assertEqual(method, 'GET')
+            result = dict(self.repo)
+        else:
+            self.fail((method, path, payload))
+        self.after_request(method, path, payload)
+        return result
+
+    def git(self, *args, cwd=None):
+        return self.real_run(['git', *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    def remote(self, *args):
+        return self.git('--git-dir', str(self.bare), *args)
+
+    def source(self, *, raw=False, files=None, modes=None):
+        root = self.root / 'source'
+        root.mkdir()
+        self.git('init', '--template=', '--initial-branch=main', cwd=root)
+        for name, content in (files if files is not None else render(Site('puzzles'), raw=raw)).items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding='utf-8')
+            if modes and name in modes:
+                path.chmod(modes[name])
+        self.git('add', '.', cwd=root)
+        self.git('-c', 'user.name=test', '-c', 'user.email=test@example.com',
+                 '-c', 'commit.gpgsign=false', 'commit', '-m', 'Original template', cwd=root)
+        self.git('push', str(self.bare), 'main', cwd=root)
+        return self.remote('rev-parse', 'main')
+
+    def initialize(self, *, domain='', description=''):
+        def run(command, **kwargs):
+            self.git_calls.append((command, kwargs.get('env', {})))
+            self.assertEqual(kwargs['timeout'], 90)
+            self.before_git(command)
+            if 'remote' in command and command[-4:-1] == ['remote', 'add', 'origin']:
+                command = [*command[:-1], str(self.bare)]
+            return self.real_run(command, **kwargs)
+        with patch('factory.GitHub', return_value=self.api), patch('factory.subprocess.run', side_effect=run):
+            return self.run_cli(['initialize'], {'REPOSITORY_NAME': 'puzzles', 'SITE_DESCRIPTION': description,
+                'CUSTOM_DOMAIN': domain, 'GH_TOKEN': 'secret-test-token', 'GIT_TRACE': 'secret-test-token',
+                'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.hooksPath', 'GIT_CONFIG_VALUE_0': '/unsafe'})
+
+    def writes(self):
+        return [(method, path, payload) for method, path, payload in self.calls if method != 'GET']
+
+    def test_empty_target_gets_one_independent_commit_and_configured_pages(self):
+        self.repo['default_branch'] = 'master'
+        result, output = self.initialize(domain='puzzles.mamachanko.com')
+        self.assertEqual((result, self.remote('rev-list', '--count', 'main')), (0, '1'), output)
+        self.assertEqual(self.remote('show', 'main:site/index.html'), render(Site('puzzles', domain='puzzles.mamachanko.com'))['site/index.html'].strip())
+        self.assertIn('[skip ci]', self.remote('log', '-1', '--format=%B', 'main'))
+        self.assertEqual(self.repo['default_branch'], 'main')
+        self.assertEqual(self.pages, {'build_type': 'workflow', 'cname': 'puzzles.mamachanko.com'})
+        self.assertEqual([call[0] for call in self.writes()], ['PATCH', 'POST', 'PUT', 'POST'])
+        self.assertTrue(self.writes()[-1][1].endswith('/dispatches'))
+        for command, env in self.git_calls:
+            self.assertNotIn('secret-test-token', ' '.join(command))
+            self.assertNotIn('GIT_TRACE', env)
+            self.assertNotIn('GIT_CONFIG_COUNT', env)
+            self.assertNotIn('--force', command)
+            self.assertNotIn('checkout', command)
+            self.assertNotIn('clone', command)
+        self.assertNotIn('secret-test-token', output)
+        self.assertIn('Site initialized', output)
+        self.assertNotIn('secret-test-token', self.remote('show', 'main:README.md'))
+
+    def test_first_push_can_automatically_select_main_as_default(self):
+        self.repo['default_branch'] = 'master'
+        def auto_select(method, path, payload):
+            if method == 'GET' and path == '/repos/mamachanko/puzzles' and self.remote('for-each-ref'):
+                self.repo['default_branch'] = 'main'
+        self.before_request = auto_select
+        result, output = self.initialize()
+        self.assertEqual(result, 0, output)
+        self.assertEqual(self.repo['default_branch'], 'main')
+        self.assertFalse(any(method == 'PATCH' for method, _, _ in self.calls))
+
+    def test_raw_template_history_is_preserved_as_direct_parent(self):
+        parent = self.source(raw=True)
+        result, output = self.initialize()
+        self.assertEqual(result, 0, output)
+        self.assertEqual(self.remote('rev-parse', 'main^'), parent)
+        self.assertEqual(self.remote('rev-list', '--count', 'main'), '2')
+        self.assertEqual(self.remote('show', 'main:README.md'), render(Site('puzzles'))['README.md'].strip())
+        self.assertIn('[skip ci]', self.remote('log', '-1', '--format=%B', 'main'))
+
+    def test_exact_rendered_rerun_only_dispatches(self):
+        parent = self.source()
+        self.pages = {'build_type': 'workflow', 'cname': None}
+        for _ in range(2):
+            self.calls.clear()
+            result, output = self.initialize()
+            self.assertEqual(result, 0, output)
+            self.assertEqual(self.remote('rev-parse', 'main'), parent)
+            self.assertEqual(len(self.writes()), 1)
+            self.assertTrue(self.writes()[0][1].endswith('/dispatches'))
+        self.assertFalse(any('push' in call[0] for call in self.git_calls))
+
+    def test_interrupted_pages_mutations_converge_using_fresh_state(self):
+        for interrupted_method in ('POST', 'PUT'):
+            with self.subTest(method=interrupted_method):
+                self.pages = None
+                self.calls.clear()
+                def interrupt(method, path, payload):
+                    if method == interrupted_method and path.endswith('/pages'):
+                        self.after_request = lambda *args: None
+                        raise FactoryError('Uncertain Pages response')
+                self.after_request = interrupt
+                result, output = self.initialize(domain='puzzles.mamachanko.com')
+                self.assertEqual(result, 1, output)
+                parent = self.remote('rev-parse', 'main')
+                self.calls.clear()
+                result, output = self.initialize(domain='puzzles.mamachanko.com')
+                self.assertEqual(result, 0, output)
+                self.assertEqual(self.remote('rev-parse', 'main'), parent)
+                self.assertFalse(any(method == interrupted_method and path.endswith('/pages') for method, path, _ in self.writes()))
+
+    def test_interrupted_default_branch_update_can_finish_from_rendered_state(self):
+        self.repo['default_branch'] = 'master'
+        def interrupt(method, path, payload):
+            if method == 'PATCH':
+                raise APIError(method, path, 403)
+        self.before_request = interrupt
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        parent = self.remote('rev-parse', 'main')
+        self.assertEqual(self.repo['default_branch'], 'master')
+        self.before_request = lambda *args: None
+        result, output = self.initialize()
+        self.assertEqual(result, 0, output)
+        self.assertEqual(self.remote('rev-parse', 'main'), parent)
+        self.assertEqual(self.repo['default_branch'], 'main')
+
+    def test_different_rendering_is_rejected_without_api_writes(self):
+        parent = self.source()
+        result, output = self.initialize(description='Different original inputs')
+        self.assertEqual(result, 1, output)
+        self.assertIn('refusing to overwrite source', output)
+        self.assertEqual(self.remote('rev-parse', 'main'), parent)
+        self.assertEqual(self.writes(), [])
+
+    def test_other_source_bytes_paths_and_modes_are_rejected(self):
+        files = render(Site('puzzles'))
+        files['site/index.html'] += '\nUser edit\n'
+        self.source(files=files)
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertEqual(self.writes(), [])
+        self.assertFalse(any('push' in call[0] for call in self.git_calls))
+
+    def test_extra_executable_mode_is_rejected(self):
+        self.source(raw=True, modes={'scripts/check_site.py': 0o755})
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertEqual(self.writes(), [])
+
+    def test_added_tracked_file_is_rejected(self):
+        self.source(raw=True, files={**render(Site('puzzles'), raw=True), 'unexpected': 'extra'})
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertEqual(self.writes(), [])
+
+    def test_other_branches_or_tags_are_rejected(self):
+        parent = self.source(raw=True)
+        for ref in ('refs/heads/other', 'refs/tags/v1'):
+            with self.subTest(ref=ref):
+                self.remote('update-ref', ref, parent)
+                result, output = self.initialize()
+                self.assertEqual(result, 1, output)
+                self.assertIn('unsupported refs', output)
+                self.assertEqual(self.writes(), [])
+                self.remote('update-ref', '-d', ref)
+
+    def test_concurrent_push_is_rejected_without_overwriting_history(self):
+        parent = self.source(raw=True)
+        competing = None
+        def race(command):
+            nonlocal competing
+            if 'push' in command:
+                self.before_git = lambda command: None
+                source = self.root / 'source'
+                self.git('-c', 'user.name=test', '-c', 'user.email=test@example.com',
+                         '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'Concurrent edit', cwd=source)
+                self.git('push', str(self.bare), 'main', cwd=source)
+                competing = self.remote('rev-parse', 'main')
+        self.before_git = race
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertNotEqual(competing, parent)
+        self.assertEqual(self.remote('rev-parse', 'main'), competing)
+        self.assertEqual(self.writes(), [])
+        self.assertIn('No force push was attempted', output)
+
+    def test_target_symlink_is_rejected_without_following_it(self):
+        self.source(raw=True)
+        source = self.root / 'source'
+        marker = self.root / 'not-published'
+        marker.write_text('private local content')
+        path = source / 'site/index.html'
+        path.unlink()
+        path.symlink_to(marker)
+        self.git('add', '.', cwd=source)
+        self.git('-c', 'user.name=test', '-c', 'user.email=test@example.com',
+                 '-c', 'commit.gpgsign=false', 'commit', '-m', 'Symlink', cwd=source)
+        self.git('push', str(self.bare), 'main', cwd=source)
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertNotIn('private local content', output)
+        self.assertEqual(self.writes(), [])
+
+    def test_raw_template_with_another_default_is_rejected(self):
+        self.source(raw=True)
+        self.repo['default_branch'] = 'master'
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertIn('template target must use main', output)
+        self.assertEqual(self.writes(), [])
+
+    def test_inaccessible_target_aborts_before_git(self):
+        for status in (401, 403, 404, 429, 500):
+            with self.subTest(status=status):
+                self.api.reset_mock()
+                self.api.request.side_effect = APIError('GET', '/repos/mamachanko/puzzles', status)
+                result, output = self.initialize()
+                self.assertEqual(result, 1, output)
+                self.assertIn(f'HTTP {status}', output)
+                self.assertEqual(self.api.request.call_count, 1)
+                self.assertEqual(self.git_calls, [])
+
+    def test_unsafe_metadata_is_rejected_before_git_or_writes(self):
+        original = dict(self.repo)
+        for changes in ({'id': 0}, {'id': True}, {'private': True}, {'visibility': 'private'},
+                        {'archived': True}, {'disabled': True}, {'fork': True}, {'mirror_url': 'https://evil'},
+                        {'full_name': 'other/puzzles'}, {'name': 'other'}, {'owner': {'login': 'mamachanko', 'type': 'Organization'}},
+                        {'owner': {'login': 'other', 'type': 'User'}}):
+            with self.subTest(changes=changes):
+                self.repo = {**original, **changes}
+                result, output = self.initialize()
+                self.assertEqual(result, 1, output)
+                self.assertEqual(self.git_calls, [])
+                self.assertEqual(self.writes(), [])
+
+    def test_pages_conflicts_abort_before_source_push(self):
+        for pages, domain in (({'build_type': 'legacy', 'cname': None}, ''),
+                              ({'build_type': 'workflow', 'cname': 'other.mamachanko.com'}, ''),
+                              ({'build_type': 'workflow', 'cname': 'other.mamachanko.com'}, 'puzzles.mamachanko.com')):
+            with self.subTest(pages=pages, domain=domain):
+                self.pages = pages
+                result, output = self.initialize(domain=domain)
+                self.assertEqual(result, 1, output)
+                self.assertIn('conflicts', output)
+                self.assertEqual(self.writes(), [])
+                self.assertEqual(self.remote('for-each-ref'), '')
+                self.assertFalse(any('push' in call[0] for call in self.git_calls))
+
+    def test_matching_domain_is_preserved(self):
+        self.pages = {'build_type': 'workflow', 'cname': 'puzzles.mamachanko.com'}
+        result, output = self.initialize(domain='puzzles.mamachanko.com')
+        self.assertEqual(result, 0, output)
+        self.assertEqual(len(self.writes()), 1)
+        self.assertTrue(self.writes()[0][1].endswith('/dispatches'))
+
+    def test_identity_change_before_push_is_rejected(self):
+        gets = 0
+        def change_identity(method, path, payload):
+            nonlocal gets
+            if method == 'GET' and path == '/repos/mamachanko/puzzles':
+                gets += 1
+                if gets == 2:
+                    self.repo['id'] = 43
+        self.before_request = change_identity
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertEqual(self.remote('for-each-ref'), '')
+        self.assertEqual(self.writes(), [])
+
+    def test_main_change_before_settings_prevents_settings_and_dispatch(self):
+        parent = self.source(raw=True)
+        def change_main(method, path, payload):
+            if method == 'GET' and path == '/repos/mamachanko/puzzles' and self.remote('rev-parse', 'main') != parent:
+                self.remote('update-ref', 'refs/heads/main', parent)
+        self.before_request = change_main
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertIn('changed during initialization', output)
+        self.assertEqual(self.writes(), [])
+
+    def test_domain_change_before_dispatch_is_rejected(self):
+        def change_domain(method, path, payload):
+            if method == 'POST' and path.endswith('/pages'):
+                self.pages['cname'] = 'other.mamachanko.com'
+        self.after_request = change_domain
+        result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertFalse(any(path.endswith('/dispatches') for _, path, _ in self.calls))
+
+    def test_pages_response_must_confirm_domain_before_dispatch(self):
+        def ignore_domain(method, path, payload):
+            if method == 'PUT' and path.endswith('/pages'):
+                self.pages['cname'] = None
+        self.after_request = ignore_domain
+        result, output = self.initialize(domain='puzzles.mamachanko.com')
+        self.assertEqual(result, 1, output)
+        self.assertIn('was not confirmed', output)
+        self.assertFalse(any(path.endswith('/dispatches') for _, path, _ in self.calls))
+
+    def test_dispatch_retries_recheck_main_and_pages(self):
+        self.source()
+        self.pages = {'build_type': 'workflow', 'cname': None}
+        def fail_dispatch(method, path, payload):
+            if path.endswith('/dispatches'):
+                self.pages['cname'] = 'other.mamachanko.com'
+                raise APIError(method, path, 404)
+        self.before_request = fail_dispatch
+        with patch('factory.dispatch', side_effect=lambda api, site, check: dispatch(api, site, sleep=Mock(), check=check)):
+            result, output = self.initialize()
+        self.assertEqual(result, 1, output)
+        self.assertEqual(sum(path.endswith('/dispatches') for _, path, _ in self.calls), 1)
+        self.assertIn('conflicts', output)
+
+    def test_git_failure_diagnostics_hide_secrets(self):
+        with patch('factory.GitHub', return_value=self.api), patch('factory.subprocess.run',
+                side_effect=subprocess.CalledProcessError(1, ['git'], stderr='secret-test-token')):
+            result, output = self.run_cli(['initialize'], {'REPOSITORY_NAME': 'puzzles', 'GH_TOKEN': 'secret-test-token'})
+        self.assertEqual(result, 1)
+        self.assertNotIn('secret-test-token', output)
+        self.assertIn('No force push was attempted', output)
 
 
 if __name__ == '__main__':

@@ -1,18 +1,18 @@
 # site-factory
 
-Launch an independent, public GitHub Pages website in `mamachanko`'s personal account from one manual workflow. Supply a repository name, a description, and optionally a custom domain. The factory copies a vanilla HTML/CSS/JavaScript starter, makes one initial commit on `main`, configures Pages, and dispatches deployment. There is no separate template repository, build framework, runtime dependency on this factory, or DNS integration.
+Prepare an existing public repository in `mamachanko`'s personal account for Codex and GitHub Pages. Create the repository yourself, grant the existing factory App access, then run **Initialize site**. The factory adds a vanilla HTML/CSS/JavaScript starter, configures Pages, and dispatches deployment. Each site stays independent and buildless. The factory does not create repositories, host a template repository, or change DNS.
 
-**Dry run is the default.** It validates inputs, renders the starter in memory, and prints the operations, expected URLs, and exact proposed DNS records. It needs no App credentials and makes no GitHub requests, so it cannot check repository availability. This implementation's tests never create real GitHub repositories.
+**Dry run is the default.** It validates inputs, renders the starter in memory, and prints the operations, expected URLs, and exact proposed DNS records. It needs no App credentials and makes no GitHub requests, so it cannot check the target repository, App access, or Pages settings. Tests never create real GitHub repositories.
 
 ## How it works
 
 ```text
 site-factory/
 ├── .github/workflows/
-│   ├── create-site.yml       Manual factory, main branch only
+│   ├── initialize-site.yml   Manual factory, main branch only
 │   └── ci.yml                Unprivileged factory tests on PRs and main
 ├── scripts/factory.py        Validation, rendering, REST API, safe Git push, reporting
-├── starter/                  Everything copied into a new repository
+├── starter/                  Everything copied into an eligible repository
 ├── tests/                    Offline API mocks, local Git integration, YAML checks
 └── requirements-dev.txt      PyYAML for workflow tests; no runtime packages
 ```
@@ -46,24 +46,24 @@ Only `site/` is uploaded to Pages. Source guidance, tests, scripts, and workflow
 
    | Permission | Level | Purpose |
    | --- | --- | --- |
-   | Administration | Read and write | Create repositories, set the default branch, enable/configure Pages |
-   | Contents | Read and write | Read repository state and push the initial commit |
-   | Workflows | Read and write | Include `.github/workflows` in the initial commit |
+   | Administration | Read and write | Set the default branch and configure Pages |
+   | Contents | Read and write | Read repository state and push starter commits |
+   | Workflows | Read and write | Write the starter `.github/workflows` files |
    | Pages | Read and write | Enable workflow-based Pages and set its custom domain |
    | Actions | Read and write | Dispatch the initial deployment workflow |
    | Metadata | Read-only (automatic) | GitHub's mandatory metadata access |
 
    Do not grant unrelated permissions, account permissions, or a classic PAT.
 4. Create the App. Copy its **App ID** and generate a **private key**. Keep the downloaded PEM private.
-5. Under Install App, install it on **mamachanko**, choose **Only select repositories**, and select **site-factory**. If permissions are later changed, approve the updated installation permissions too.
+5. Under Install App, install it on **mamachanko**, choose **Only select repositories**, and select **site-factory**. Before each initialization, add the target repository to this installation's selected repositories. If permissions are later changed, approve the updated installation permissions too.
 6. In **site-factory → Settings → Environments**, create `site-factory-live`. Under **Deployment branches and tags**, choose **Selected branches and tags** and add a **Branch** rule for `main`. Then add an **Environment secret** named `SITE_FACTORY_APP_PRIVATE_KEY` with the entire PEM, including header/footer and line breaks. If upgrading an existing setup, remove the repository-level copy of the secret after setting up the restricted environment.
 7. In **site-factory → Settings → Secrets and variables → Actions → Variables**, add the App's numeric ID as the repository variable `SITE_FACTORY_APP_ID`.
 
 8. Enable GitHub Actions in site-factory. Keep the repository's default branch as **main** and make these files available on that branch before running the workflow. Allow the official `actions/*` used here under any Actions policy. The generated repositories also need Actions and Pages allowed by account policy.
 
-GitHub grants an App access to repositories it creates, even with a selected-repositories installation. The first token uses hardcoded `owner: mamachanko`, covers the installation, and requests only Administration write in addition to implicit Metadata read. After creation, a second `actions/create-github-app-token` step mints a fresh token scoped to the new repository with the permissions needed to populate and deploy it. Both tokens are short-lived and revoked by the action's default post-job cleanup.
+For an existing installation, keep the same numeric `SITE_FACTORY_APP_ID` variable and PEM `SITE_FACTORY_APP_PRIVATE_KEY` environment secret. Grant the App access to each target repository before running initialization. The live job mints one token scoped to that target, with the repository permissions above. It never mints an owner-wide token. The action revokes the token during its default post-job cleanup.
 
-The workflow runs only from `main` in `mamachanko/site-factory`. The plan job runs before live creation and can run without the environment configured. Only the live job uses `site-factory-live`. Restrict write access and protect `main` to control changes to code that receives the App credentials. PR CI uses a read-only `GITHUB_TOKEN` and receives no App credentials. Generated sites use their own `GITHUB_TOKEN`, with `pages: write` and `id-token: write` in the deployment job and `contents: read` and `pages: read` in the check-and-upload job.
+The workflow runs only from `main` in `mamachanko/site-factory`. Credential-free planning must succeed before the live job can run in `site-factory-live`. At most one run for a target repository proceeds at a time. Restrict write access and protect `main` to control changes to code that receives App credentials. PR CI uses a read-only `GITHUB_TOKEN` and receives no App credentials. Generated sites use their own `GITHUB_TOKEN`, with `pages: write` and `id-token: write` in the deployment job and `contents: read` and `pages: read` in the check-and-upload job.
 
 ## Verify domains before first use
 
@@ -81,8 +81,10 @@ If the domain uses third-party nameservers, edit records at the **authoritative 
 
 ## First website: puzzles.mamachanko.com
 
-1. Open **site-factory → Actions → Create site → Run workflow** on `main`.
-2. Enter:
+For a first test on the default Pages domain, leave `custom_domain` blank. Once the deployment succeeds, open `https://mamachanko.github.io/puzzles/`.
+
+1. Create public **mamachanko/puzzles** yourself. Leave it empty, without a README, license, or `.gitignore`. Alternatively, use a template that contains an exact, unrendered copy of this factory revision's `starter/` contents at the repository root. Include all files, including dotfiles, with their original modes. The only branch must be `main`, with no tags or extra files. Do not place the files inside a `starter/` directory. This factory does not provide a hosted template.
+2. In the existing factory App installation, grant access to **puzzles**. Open **site-factory → Actions → Initialize site → Run workflow** on `main`. Enter:
 
    ```text
    repository_name: puzzles
@@ -91,15 +93,14 @@ If the domain uses third-party nameservers, edit records at the **authoritative 
    dry_run: true
    ```
 
-3. Run it and review the job summary. This checks local validation/generation without credentials or network requests. It does not reserve the name, check App installation, prove domain ownership, or validate GitHub settings.
-4. Run the same workflow with **dry_run unchecked (`false`)**. Live execution:
-   - Checks for an existing repository and refuses to overwrite one.
-   - Creates **public** `mamachanko/puzzles` through `POST /user/repos`.
-   - Refreshes the token and verifies the new repository ID before populating it.
-   - Pushes the whole starter in a single initial commit on `main`, with `[skip ci]`. No force push is used; a nonempty remote is rejected. Skipping initial push CI prevents an early deployment before Pages/domain configuration.
-   - Sets the default branch to `main` and enables Pages with `build_type: workflow`.
-   - Sets and confirms `puzzles.mamachanko.com` through the Pages API, without a `CNAME` file.
-   - Explicitly dispatches `.github/workflows/deploy.yml` on `main`. Registration delays are retried at most eight times with capped exponential delays (60 seconds total waiting).
+3. Run it and review the job summary. This checks local validation and rendering without credentials or network requests. It does not inspect the target, check App access, prove domain ownership, or validate GitHub settings.
+4. Run the same workflow with the same inputs and **dry_run unchecked (`false`)**. Live execution:
+   - Verifies that the target exists, is public, and belongs to the `mamachanko` personal account.
+   - Accepts an empty repository, the exact raw starter on `main`, or the exact rendered starter on `main` from this factory revision and these inputs. Other branches, tags, extra files, and changed files are refused.
+   - Checks Pages for conflicting settings before writing source. Existing Pages must use GitHub Actions and have no custom domain or the exact requested domain. A configured domain conflicts with an empty domain request.
+   - Adds rendered starter files with a normal initial or fast-forward push on `main`. Existing rendered files need no push. No force push is used. The starter commit includes `[skip ci]` to avoid deployment before Pages configuration.
+   - Sets the default branch to `main`, enables Pages with `build_type: workflow` if absent, and sets and confirms the requested custom domain without a `CNAME` file.
+   - Explicitly dispatches `.github/workflows/deploy.yml` on `main`. Registration delays have a bounded retry budget.
 5. After success, confirm **puzzles → Settings → Pages** shows **GitHub Actions** and the intended domain. The summary reports the repository URL, expected deployment URL, workflow URL, and the following exact Namecheap record:
 
    ```text
@@ -133,7 +134,7 @@ python3 -m http.server 8000 --directory site
 
 Open http://localhost:8000. Start Codex in this repository, or run Claude Code from its root. `AGENTS.md` supplies the shared instructions and `CLAUDE.md` points to it. A useful first task is: “Replace the warm-up with a mobile-first word game. Keep the site buildless, preserve keyboard access and status feedback, and add tests for the game rules.”
 
-Use a PR and let CI run. Merging to `main` automatically checks, uploads, and deploys the site; Actions → Deploy to GitHub Pages → Run workflow can redeploy manually. The site has no runtime link to site-factory. You can remove the factory App's access to the generated repo after creation; its normal deployment continues to use `GITHUB_TOKEN`.
+Use a PR and let CI run. Merging to `main` automatically checks, uploads, and deploys the site; Actions → Deploy to GitHub Pages → Run workflow can redeploy manually. The site has no runtime link to site-factory. You can remove the factory App's access to the generated repo after successful initialization; its normal deployment continues to use `GITHUB_TOKEN`.
 
 ## Develop and test this factory
 
@@ -158,9 +159,15 @@ CUSTOM_DOMAIN=puzzles.mamachanko.com \
 python3 scripts/factory.py plan
 ```
 
-The `create` and `finish` phases are for the trusted workflow, with `GH_TOKEN` supplied by the App action and a runner-local receipt via `--state`. The receipt contains only the configuration and new repository ID. Do not use a PAT or put tokens in commands, remotes, files, or commits. Git authentication uses `gh auth git-credential`, reading the token from the environment, with inherited Git tracing/configuration disabled. Git/HTTP failure reports intentionally omit raw diagnostics that might expose credentials.
+The `initialize` command is for the trusted live job, with `GH_TOKEN` supplied by the target-scoped App action:
 
-Tests cover strict names/domains, DNS variants, escaped and single-pass substitution, complete generated files, a working generated site's checks and tests, dry-run isolation, existing and inaccessible repositories, creation races, identity checks, API errors, domain-before-dispatch ordering, bounded registration retries, safe failure summaries, workflow permissions/triggers, and one-commit initialization against a temporary **local bare Git repository**. No tests create a GitHub repository, dispatch a live workflow, or edit DNS. YAML parsing/security assertions complement `actionlint` when that tool is available. Static checks are sanity checks, not a comprehensive HTML/accessibility validator; manually test keyboard and mobile behavior when extending the starter.
+```sh
+REPOSITORY_NAME=puzzles python3 scripts/factory.py initialize
+```
+
+Use the same description and domain environment variables as the plan. There is no local receipt or separate creation phase. Do not use a PAT or put tokens in commands, remotes, files, or commits. Git authentication uses `gh auth git-credential`, reading the token from the environment, with inherited Git tracing and configuration disabled. Git and HTTP failure reports omit raw diagnostics that might expose credentials.
+
+Tests use offline API mocks and temporary local bare Git repositories. They cover validation, rendering, eligible repository states, identity and concurrency checks, Pages conflicts, retry behavior, deployment ordering, workflow scoping, and failure summaries. No test creates a GitHub repository, dispatches a live workflow, or edits DNS. YAML security assertions complement `actionlint` when available. These checks do not prove that a live App grant or account policy permits initialization. A separately authorized live run must confirm App access, Git authentication, Pages configuration, and deployment. Static site checks are sanity checks. Manually test keyboard and mobile behavior when extending the starter.
 
 ## Troubleshoot and recover
 
@@ -168,24 +175,25 @@ Tests cover strict names/domains, DNS variants, escaped and single-pass substitu
 | --- | --- |
 | Workflow is absent or skipped | Commit it to default `main`; dispatch on `main` in `mamachanko/site-factory`. Other branches/repos are intentionally skipped. |
 | App-token step fails | App ID variable, complete PEM in the `site-factory-live` environment, installation on the personal account, approved permissions, and selected repository access. |
-| HTTP 401/403 | Token expiry, permissions, App installation, or account Actions/Pages policy. After a create succeeded, verify App access to the new repo before manual recovery. Do not substitute a classic PAT. |
-| Repository already exists / create HTTP 422 | Choose another name. A 404 preflight may hide an inaccessible private repo; GitHub's unique-name check still prevents replacement. Creation is never retried automatically. |
-| Git push fails | Confirm Contents and Workflows write, App access to the new repo, an empty remote, and account push rules. The factory never force-pushes. Inspect the repository before further work. |
+| HTTP 401/403 | Token expiry, permissions, App access to the existing target, or account Actions/Pages policy. Do not substitute a classic PAT. |
+| Target not eligible | Confirm that the target is public and owned by the `mamachanko` personal account. Inspect refs and the complete tree. Only an empty repository or the exact raw/rendered starter on `main` is supported. |
+| Git push fails | Confirm Contents and Workflows write, App access, account push rules, and no concurrent edits. The factory never force-pushes. Inspect the repository before retrying. |
 | Pages creation/configuration HTTP 422 | Check Pages eligibility, default branch/initial commit, account policies, domain spelling, domain ownership/verification, or whether another Pages site already claims it. Do not add pointing DNS until the intended domain is confirmed. |
-| Dispatch keeps returning 404/422 | Registration retry budget expired. Confirm `main` contains `.github/workflows/deploy.yml`, Actions is enabled, and the refreshed token has Actions write. Once Pages/domain configuration is confirmed, manually dispatch Deploy to GitHub Pages in the new repo. |
-| Deployment fails after factory success | Open the new repo's deployment workflow. Check tests, Pages source, environment protection/required reviewers, allowed action policy, and Pages availability. This is isolated from repository creation. |
+| Dispatch keeps returning 404/422 | Registration retry budget expired. Confirm `main` contains `.github/workflows/deploy.yml`, Actions is enabled, and the target token has Actions write. Once Pages/domain configuration is confirmed, manually dispatch Deploy to GitHub Pages in the target repo. |
+| Deployment fails after factory success | Open the target repo's deployment workflow. Check tests, Pages source, environment protection/required reviewers, allowed action policy, and Pages availability. The target workflow runs independently after initialization. |
 | Domain does not resolve / certificate pending | Confirm authoritative DNS, exact Host/Value, no conflicting records, successful deployment, and Settings → Pages DNS/TLS state. Wait for propagation; enable Enforce HTTPS when available. |
 
-Live failures are deliberately **not transactional**. The summary reports the last completed operation and failing API/status without dumping tokens, headers, or raw response bodies. It never deletes a repository or rolls back user-visible state automatically. A timeout during creation may have created the repository even if no response arrived; inspect GitHub before retrying.
+Live failures are **not transactional**. The summary reports the last completed operation and failing API/status without dumping credentials or raw response bodies. The factory never deletes a repository or rolls back visible changes automatically.
 
-If creation succeeded but a later step failed, rerunning the factory with that name will refuse to overwrite it. Inspect the new repo and complete the missing work manually: if empty, copy/render the starter and make a normal initial push on `main`; if already populated, fix the failed setting without reseeding. Set Pages source to GitHub Actions, set and confirm the custom domain if needed, then manually dispatch deployment. Only add pointing DNS after that domain confirmation. Alternatively, deliberately remove an abandoned repository yourself after reviewing it, then start a fresh run. The factory provides no destructive recovery command.
+Inspect the target after a failure, then retry with the **same factory revision and identical inputs**. Use **Re-run all jobs** on the original live run to keep its revision and inputs. The exact rendered starter is a supported retry state when Pages settings or deployment dispatch remain incomplete. Changed files or a newer starter revision cause refusal. After the site has been edited, complete any missing Pages setup or deployment manually instead of rerunning initialization. An ambiguous dispatch can queue another deployment on retry. The target workflow serializes Pages deployments.
+
+Avoid external edits during initialization. The factory checks refs and repository identity again before writes and uses normal Git push protections. Git refs and Pages settings cannot change atomically, so these checks cannot prevent every concurrent settings change. Do not add pointing DNS until Settings → Pages confirms the intended custom domain.
 
 ## Official references
 
 The workflows pin actions to full upstream commit SHAs. The comments beside each pin identify the major release line. Review the upstream release when updating a pin.
 
-- [Create a repository for the authenticated user](https://docs.github.com/en/rest/repos/repos#create-a-repository-for-the-authenticated-user) — installation-token support and Administration permission.
-- [Install your own GitHub App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app) — selected repositories and automatic access to App-created repositories.
+- [Install your own GitHub App](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app) — selected repository access.
 - [Create GitHub App token action](https://github.com/actions/create-github-app-token) — owner/repository scoping, permission inputs, token cleanup.
 - [Pages REST API](https://docs.github.com/en/rest/pages/pages) — `build_type: workflow`, Pages creation, and custom-domain settings.
 - [Use custom workflows with Pages](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages) — official actions, artifact, permissions, and deployment environment.

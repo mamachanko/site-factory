@@ -1,4 +1,5 @@
 import contextlib
+from email.message import Message
 import io
 import json
 import os
@@ -302,6 +303,82 @@ class CLITests(unittest.TestCase):
             self.assertIn('HTTP 403', summary.read_text())
             self.assertIn('No automatic rollback', output)
             self.assertNotIn('secret', output)
+
+    def test_create_http_failure_reports_only_safe_diagnostics(self):
+        request_id = 'CFF6:2A1BFD:91E587C:DB831B4:6AFEE42D'
+        cases = (
+            (403, {}, {'message': 'Resource not accessible by integration'}, 'access denied'),
+            (403, {}, {'message': 'Resource not accessible by personal access token'}, 'access denied'),
+            (429, {}, {'message': 'private unknown message'}, 'rate limited'),
+            (403, {'X-RateLimit-Remaining': '0'}, {}, 'rate limited'),
+            (403, {'Retry-After': '60'}, {}, 'rate limited'),
+            (403, {'X-RateLimit-Remaining': '4994'}, {'message': 'Rate Limit Exceeded'}, 'rate limited'),
+            (403, {}, {'message': 'API rate limit exceeded for 192.0.2.1.'}, 'rate limited'),
+            (403, {}, {'message': 'You have exceeded a secondary rate limit. Please wait a few minutes before you try again.'}, 'rate limited'),
+            (403, {}, {'message': 'private unknown message'}, None),
+            (403, {'X-RateLimit-Remaining': '4994'}, {'message': 'private unknown message'}, None),
+            (403, {}, {'message': 'Resource not accessible by integration private unknown message'}, None),
+            (500, {}, {'message': 'Resource not accessible by integration'}, None),
+            (403, {}, {'message': ['private unknown message']}, None),
+            (403, {}, ['private unknown message'], None),
+            (403, {}, b'not JSON private unknown message', None),
+            (403, {}, b'\xff private unknown message', None),
+        )
+        for status, headers, body, category in cases:
+            with self.subTest(status=status, headers=headers, body=body):
+                response_headers = Message()
+                for key, value in {**headers, 'x-github-request-id': request_id,
+                                   'X-Private-Header': 'secret-test-token'}.items():
+                    response_headers[key] = value
+                if not isinstance(body, bytes):
+                    body = json.dumps({**body, 'private': 'secret-test-token'} if isinstance(body, dict) else body).encode()
+                failure = urllib.error.HTTPError('https://api.github.com/user/repos', status,
+                    'secret-test-token', response_headers, io.BytesIO(body))
+                self.assert_create_http_failure(failure, category, request_id)
+
+    def test_create_http_failure_rejects_unsafe_request_ids_and_preserves_unreadable_status(self):
+        for request_id in ('secret-test-token', 'ABCD:123456:ABCDEF:123456:ABCDEF12\nsecret-test-token',
+                           '<script>secret-test-token</script>', 'ABCD1234', 'A:B:C:D:E:F', 'A:' + 'B' * 200):
+            with self.subTest(request_id=request_id):
+                failure = urllib.error.HTTPError('https://api.github.com/user/repos', 403, 'secret-test-token',
+                    {'X-GitHub-Request-Id': request_id}, io.BytesIO(b'{"message":"Rate Limit Exceeded"}'))
+                self.assert_create_http_failure(failure, 'rate limited', None)
+        unreadable = Mock()
+        unreadable.read.side_effect = OSError('secret-test-token')
+        failure = urllib.error.HTTPError('https://api.github.com/user/repos', 403, 'secret-test-token',
+            {'X-RateLimit-Remaining': '0'}, unreadable)
+        self.assert_create_http_failure(failure, 'rate limited', None)
+        deeply_nested = io.BytesIO(b'[' * 16000 + b']' * 16000)
+        request_id = 'CFF6:2A1BFD:91E587C:DB831B4:6AFEE42D'
+        failure = urllib.error.HTTPError('https://api.github.com/user/repos', 403, 'secret-test-token',
+            {'X-GitHub-Request-Id': request_id}, deeply_nested)
+        self.assert_create_http_failure(failure, None, request_id)
+
+    def assert_create_http_failure(self, failure, category, request_id):
+        with tempfile.TemporaryDirectory() as directory, patch('factory.urllib.request.build_opener') as build_opener:
+            opener = build_opener.return_value
+            opener.open.side_effect = [urllib.error.HTTPError('https://api.github.com/repos/mamachanko/puzzles',
+                404, 'secret-test-token', {}, io.BytesIO(b'{}')), failure]
+            summary = Path(directory) / 'summary.md'
+            result, output = self.run_cli(['create', '--state', str(Path(directory) / 'state.json')],
+                {'REPOSITORY_NAME': 'puzzles', 'GITHUB_STEP_SUMMARY': str(summary), 'GH_TOKEN': 'secret-test-token'})
+            self.assertEqual(result, 1)
+            self.assertEqual(opener.open.call_count, 2)
+            self.assertEqual([call.args[0].method for call in opener.open.call_args_list], ['GET', 'POST'])
+            self.assertEqual(opener.open.call_args.args[0].full_url, 'https://api.github.com/user/repos')
+            for report in (output, summary.read_text()):
+                self.assertIn(f'GitHub POST /user/repos failed (HTTP {failure.code}).', report)
+                if category:
+                    self.assertIn(f'Category: {category}.', report)
+                else:
+                    self.assertNotIn('Category:', report)
+                if request_id:
+                    self.assertIn(f'GitHub request ID: {request_id}.', report)
+                else:
+                    self.assertNotIn('GitHub request ID:', report)
+                for unsafe in ('secret-test-token', 'private unknown message', '<script>',
+                               'X-Private-Header', 'Bearer', '192.0.2.1'):
+                    self.assertNotIn(unsafe, report)
 
 
 if __name__ == '__main__':

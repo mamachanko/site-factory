@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import asdict, dataclass
 import html
+import http.client
 import json
 import os
 from pathlib import Path
@@ -25,9 +26,14 @@ class FactoryError(Exception):
 
 
 class APIError(FactoryError):
-    def __init__(self, method, path, status):
+    def __init__(self, method, path, status, *, category=None, request_id=None):
         self.status = status
-        super().__init__(f"GitHub {method} {path} failed (HTTP {status}).")
+        detail = f"GitHub {method} {path} failed (HTTP {status})."
+        if category:
+            detail += f" Category: {category}."
+        if request_id:
+            detail += f" GitHub request ID: {request_id}."
+        super().__init__(detail)
 
 
 @dataclass(frozen=True)
@@ -138,8 +144,26 @@ class GitHub:
                 body = response.read()
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as error:
-            # Do not print response bodies or request headers (may contain user input/secrets).
-            raise APIError(method, path, error.code) from None
+            headers = error.headers or {}
+            request_id = headers.get("X-GitHub-Request-Id", "")
+            if not isinstance(request_id, str) or not re.fullmatch(r"[0-9A-Fa-f]{1,8}(?::[0-9A-Fa-f]{1,8}){4}", request_id):
+                request_id = None
+            category = "rate limited" if error.code == 429 else None
+            if error.code == 403:
+                message = ""
+                try:
+                    body = json.loads(error.read(65536))
+                    if isinstance(body, dict) and isinstance(body.get("message"), str):
+                        message = body["message"].casefold()
+                except (OSError, ValueError, RecursionError, http.client.HTTPException):
+                    pass
+                if (headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After") is not None
+                        or message == "rate limit exceeded"
+                        or message.startswith(("api rate limit exceeded", "you have exceeded a secondary rate limit"))):
+                    category = "rate limited"
+                elif message in ("resource not accessible by integration", "resource not accessible by personal access token"):
+                    category = "access denied"
+            raise APIError(method, path, error.code, category=category, request_id=request_id) from None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
             raise FactoryError(f"GitHub {method} {path} had a transport/response error; inspect GitHub before retrying mutations.") from None
 

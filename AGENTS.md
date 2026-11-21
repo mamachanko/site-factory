@@ -1,7 +1,7 @@
 # Working on site-factory
 
-Read README.md before changing authentication, repository creation, DNS instructions, or workflows. Keep owner and domain restrictions in `scripts/factory.py`. Keep generated projects independent and buildless. Never create actual site repositories or modify DNS in tests.
+Read README.md before changing authentication, repository setup, or workflows. Keep owner, repository name, and domain validation in `scripts/factory.py`. Keep generated sites independent and buildless.
 
-Run `python3 -m pip install -r requirements-dev.txt`, then `python3 -m unittest discover -s tests -v`, `python3 starter/scripts/check_site.py`, and `node --test starter/tests/*.test.mjs`. Use Python 3.12+ and Node.js 24+. The factory runtime uses only Python's standard library, Git, and gh. PyYAML is a test-only dependency. Read `starter/AGENTS.md` when editing starter files.
+Furnish site runs on `main` in `mamachanko/site-factory`. It uses a GitHub App token scoped to the named repository. Keep App credentials out of PR workflows. Preserve existing site files, normal Git pushes, and safe retries.
 
-Run the manual workflows on `main` in `mamachanko/site-factory`. Furnish site starts with an owner-created repository and uses a token scoped to that repository. Create site creates the repository and refreshes the token before populating it. Keep App keys and tokens out of PR workflows. Preserve credential-free dry runs, normal Git pushes, and partial-failure reporting. Do not delete or overwrite repositories to recover from a failure.
+Use Python 3.12+, Git, and GitHub CLI. Install test dependencies with `python3 -m pip install -r requirements-dev.txt`. Run `python3 -m unittest discover -s tests -v` and `actionlint .github/workflows/*.yml templates/deploy.yml`. Tests must use mocked GitHub responses or local Git repositories.

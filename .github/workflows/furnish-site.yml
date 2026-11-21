@@ -32,7 +32,7 @@ jobs:
         id: validate
         env:
           REPOSITORY_NAME: ${{ inputs.repository_name }}
-        run: python3 scripts/controller.py validate
+        run: python3 scripts/factory.py validate
       - name: Mint an App token for only the validated repository
         id: furnish-token
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
@@ -50,7 +50,7 @@ jobs:
         env:
           REPOSITORY_NAME: ${{ steps.validate.outputs.repository_name }}
           GH_TOKEN: ${{ steps.furnish-token.outputs.token }}
-        run: python3 scripts/controller.py furnish
+        run: python3 scripts/factory.py furnish
       - name: Report workflow-level failure
         if: failure()
         shell: bash

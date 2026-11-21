@@ -125,8 +125,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class GitHub:
-    def __init__(self):
-        self.token = os.environ.get("GH_TOKEN")
+    def __init__(self, token=None):
+        self.token = os.environ.get("GH_TOKEN") if token is None else token
         if not self.token:
             raise FactoryError("GH_TOKEN is required for live operations; use the GitHub App workflow.")
         self.opener = urllib.request.build_opener(NoRedirect)

@@ -1,5 +1,22 @@
 # site-factory
 
+## Start a new site
+
+1. Create a public repository under `mamachanko` on GitHub. You can leave it empty or start from a template with `main` as its default branch.
+2. Run this from your site-factory checkout, using the name of your new repository.
+
+   ```sh
+   python3 scripts/controller.py furnish my-site
+   ```
+
+   On first use, sign in to GitHub CLI as `mamachanko` with `gh auth login --hostname github.com`. Grant workflow access with `gh auth refresh --hostname github.com --scopes workflow`.
+
+3. Give Codex the repository URL printed by the command. Ask it to build in `site/` and open a pull request. Merge the pull request to publish the changes at the printed Pages URL.
+
+The command fills in a starter page and a deployment workflow, enables GitHub Pages, and protects `main`. It waits for the first deployment. You can run it again after fixing a failed setup step.
+
+## Create a site with the GitHub App
+
 Launch an independent, public GitHub Pages website in `mamachanko`'s personal account from one manual workflow. Supply a repository name, a description, and optionally a custom domain. The factory copies a vanilla HTML/CSS/JavaScript starter, makes one initial commit on `main`, configures Pages, and dispatches deployment. There is no separate template repository, build framework, runtime dependency on this factory, or DNS integration.
 
 **Dry run is the default.** It validates inputs, renders the starter in memory, and prints the operations, expected URLs, and exact proposed DNS records. It needs no App credentials and makes no GitHub requests, so it cannot check repository availability. This implementation's tests never create real GitHub repositories.
@@ -79,41 +96,12 @@ At Namecheap, choose the relevant domain → Manage → Advanced DNS → Host Re
 
 If the domain uses third-party nameservers, edit records at the **authoritative DNS provider**, even if Namecheap is the registrar. The factory never contacts Namecheap or changes any DNS record.
 
-## First website: puzzles.mamachanko.com
+### Run the factory workflow
 
-1. Open **site-factory → Actions → Create site → Run workflow** on `main`.
-2. Enter:
-
-   ```text
-   repository_name: puzzles
-   description: A collection of mobile-first word games
-   custom_domain: puzzles.mamachanko.com
-   dry_run: true
-   ```
-
-3. Run it and review the job summary. This checks local validation/generation without credentials or network requests. It does not reserve the name, check App installation, prove domain ownership, or validate GitHub settings.
-4. Run the same workflow with **dry_run unchecked (`false`)**. Live execution:
-   - Checks for an existing repository and refuses to overwrite one.
-   - Creates **public** `mamachanko/puzzles` through `POST /user/repos`.
-   - Refreshes the token and verifies the new repository ID before populating it.
-   - Pushes the whole starter in a single initial commit on `main`, with `[skip ci]`. No force push is used; a nonempty remote is rejected. Skipping initial push CI prevents an early deployment before Pages/domain configuration.
-   - Sets the default branch to `main` and enables Pages with `build_type: workflow`.
-   - Sets and confirms `puzzles.mamachanko.com` through the Pages API, without a `CNAME` file.
-   - Explicitly dispatches `.github/workflows/deploy.yml` on `main`. Registration delays are retried at most eight times with capped exponential delays (60 seconds total waiting).
-5. After success, confirm **puzzles → Settings → Pages** shows **GitHub Actions** and the intended domain. The summary reports the repository URL, expected deployment URL, workflow URL, and the following exact Namecheap record:
-
-   ```text
-   Domain: mamachanko.com
-   Type: CNAME
-   Host: puzzles
-   Value: mamachanko.github.io
-   TTL: Automatic
-   ```
-
-   In Namecheap → Domain List → mamachanko.com → Manage → Advanced DNS → Host Records, review any existing records at `puzzles`, replace conflicting records there, and add this CNAME. Do not include `https://`, `/puzzles`, or the domain suffix in the Host field. Do not create wildcard records. Configure the Pages custom domain **before** adding the pointing DNS record.
-6. Follow **puzzles → Actions → Deploy to GitHub Pages** for actual deployment status. The factory reports a successful dispatch, not a completed deployment. DNS can take up to 24 hours, and TLS certificate provisioning can take additional time. Once available, enable **Enforce HTTPS** in Settings → Pages.
-
-The result is `https://github.com/mamachanko/puzzles` and, after deployment/DNS/TLS, `https://puzzles.mamachanko.com/`. With an empty domain, the expected URL is `https://mamachanko.github.io/puzzles/` and no DNS work is required. An existing account-level Pages custom domain can affect GitHub's default URL/redirect behavior; Settings → Pages and the deployment environment show the actual URL.
+1. Open **Actions → Create site → Run workflow** on `main`.
+2. Enter the repository name. The description and custom domain are optional.
+3. Run with **dry_run** selected to preview the changes. Clear **dry_run** and run again to create the repository.
+4. Follow **Actions → Deploy to GitHub Pages** in the new repository. If you entered a custom domain, add the DNS record from the factory's job summary after it confirms the domain in Pages settings.
 
 ### Input rules and DNS variants
 

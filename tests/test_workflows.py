@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 import yaml
 
@@ -119,6 +121,38 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn('pull_request_target', workflow['on'])
             self.assertNotIn('secrets.', path.read_text())
             self.assertNotIn('create-github-app-token', path.read_text())
+
+    def test_furnished_deployment_rejects_symlinks_before_upload(self):
+        workflow = load(ROOT / 'templates/deploy.yml')
+        steps = workflow['jobs']['upload']['steps']
+        check, = [step for step in steps if step.get('name') == 'Check site files']
+        upload = next(step for step in steps if step.get('uses', '').startswith('actions/upload-pages-artifact@'))
+        self.assertLess(steps.index(check), steps.index(upload))
+        self.assertEqual(check['shell'], 'bash')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            site = root / 'site'
+            site.mkdir()
+            (site / 'index.html').write_text('<h1>Hello</h1>')
+            outside = root / 'outside.txt'
+            outside.write_text('Harmless sibling fixture')
+
+            def run_check():
+                return subprocess.run(
+                    ['bash', '-e', '-o', 'pipefail', '-c', check['run']],
+                    cwd=root, capture_output=True, text=True,
+                )
+
+            regular = run_check()
+            self.assertEqual(regular.returncode, 0, regular.stderr)
+            for target in (outside, site / 'index.html', root / 'missing'):
+                with self.subTest(target=target.name):
+                    link = site / 'linked.txt'
+                    link.symlink_to(target)
+                    linked = run_check()
+                    self.assertNotEqual(linked.returncode, 0)
+                    self.assertIn('Remove symbolic links from site/', linked.stdout)
+                    link.unlink()
 
 
 if __name__ == '__main__':

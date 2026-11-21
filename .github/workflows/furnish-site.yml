@@ -1,4 +1,5 @@
 name: Furnish site
+run-name: Furnish ${{ inputs.repository_name }}
 
 on:
   workflow_dispatch:

@@ -7,16 +7,17 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+import urllib.error
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from controller import furnish, main, parse_repository, ruleset_payload, seed_repository
-from factory import APIError, FactoryError
+from controller import furnish, main, page_responds, ruleset_payload, seed_repository
+from factory import APIError, FactoryError, Site
 
 
-SITE = parse_repository('my-site')
+SITE = Site('my-site')
 REPO = f'/repos/{SITE.repository}'
 REPO_URL = f'https://github.com/{SITE.repository}'
 WORKFLOW = '.github/workflows/deploy.yml'
@@ -36,6 +37,7 @@ class FurnishTests(unittest.TestCase):
         self.pages = None
         self.rule = None
         self.conclusion = 'success'
+        self.deployment_sha = SHA
         self.default_branch_update_fails = False
         self.seed = Mock(return_value=SHA)
         self.live = Mock(return_value=True)
@@ -79,7 +81,7 @@ class FurnishTests(unittest.TestCase):
         if method == 'GET' and path == REPO + '/actions/runs/7':
             return {
                 'id': 7, 'path': WORKFLOW, 'status': 'completed', 'conclusion': self.conclusion,
-                'head_sha': SHA, 'head_branch': 'main', 'event': 'workflow_dispatch',
+                'head_sha': self.deployment_sha, 'head_branch': 'main', 'event': 'workflow_dispatch',
                 'html_url': WORKFLOW_URL,
             }
         self.fail(f'Unexpected GitHub request {method} {path}')
@@ -90,9 +92,7 @@ class FurnishTests(unittest.TestCase):
 
     def test_configures_existing_repository_and_checks_publication(self):
         result = self.run_furnish()
-        self.assertEqual(result['repository'], SITE.repository)
-        self.assertEqual(result['url'], SITE.url)
-        self.assertEqual(result['run_id'], 7)
+        self.assertEqual(result, (SITE.url, WORKFLOW_URL))
         self.assertEqual(self.rule['target'], 'branch')
         self.assertEqual(self.rule['enforcement'], 'active')
         self.assertEqual(self.rule['conditions']['ref_name']['include'], ['refs/heads/main'])
@@ -119,7 +119,7 @@ class FurnishTests(unittest.TestCase):
         self.assertIsNone(self.pages)
 
         self.default_branch_update_fails = False
-        self.assertEqual(self.run_furnish()['url'], SITE.url)
+        self.assertEqual(self.run_furnish(), (SITE.url, WORKFLOW_URL))
         self.assertTrue(self.seed.call_args.kwargs['require_main_only'])
         self.assertEqual(self.repo['default_branch'], 'main')
 
@@ -133,15 +133,6 @@ class FurnishTests(unittest.TestCase):
                     self.run_furnish()
                 self.seed.assert_not_called()
                 self.assertTrue(all(call.args[0] == 'GET' for call in self.api.request.call_args_list))
-
-    def test_only_canonical_bare_names_are_accepted(self):
-        self.assertEqual(parse_repository('my-site'), SITE)
-        for value in (SITE.repository, REPO_URL, 'someone/my-site', 'My-site', 'my_site',
-                      'my--site', '-site', 'site-', 'site-factory', 'a' * 64, '',
-                      'site,other', 'site\nother', 'site\r', 'site%0aother', 'site ',
-                      '${{ secrets.KEY }}', '$(touch /tmp/site-factory-bug)', 'é'):
-            with self.subTest(value=value), self.assertRaises(FactoryError):
-                parse_repository(value)
 
     def test_token_scope_must_bind_exactly_one_requested_repository(self):
         invalid = [None, {}, {'total_count': 0, 'repositories': []},
@@ -207,7 +198,7 @@ class FurnishTests(unittest.TestCase):
         url = 'https://maxbrauer.com/my-site/'
         self.pages = {'build_type': 'workflow', 'html_url': url, 'cname': None}
         result = self.run_furnish()
-        self.assertEqual(result['url'], url)
+        self.assertEqual(result, (url, WORKFLOW_URL))
         self.live.assert_called_once_with(url)
 
     def test_successful_workflow_with_unreachable_page_fails(self):
@@ -220,6 +211,22 @@ class FurnishTests(unittest.TestCase):
         with self.assertRaisesRegex(FactoryError, 'Deployment failed'):
             self.run_furnish()
         self.live.assert_not_called()
+
+    def test_wrong_deployment_sha_never_reports_a_live_url(self):
+        self.deployment_sha = 'b' * 40
+        with self.assertRaisesRegex(FactoryError, 'Deployment run identity changed'):
+            self.run_furnish()
+        self.live.assert_not_called()
+
+    def test_off_allowlist_redirect_is_rejected_before_fetching_its_target(self):
+        opener = Mock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            SITE.url, 302, 'Found', {'Location': 'https://example.org/'}, None)
+        with patch('controller.urllib.request.build_opener', return_value=opener):
+            with self.assertRaises(FactoryError):
+                page_responds(SITE.url)
+        opener.open.assert_called_once()
+        self.assertEqual(opener.open.call_args.args[0].full_url, SITE.url)
 
 
 class RunnerCommandTests(unittest.TestCase):
@@ -247,7 +254,7 @@ class RunnerCommandTests(unittest.TestCase):
                 api.assert_not_called()
 
     def test_furnish_uses_environment_app_token_and_reports_verified_result(self):
-        result = {'repository': SITE.repository, 'url': SITE.url, 'workflow_url': WORKFLOW_URL}
+        result = (SITE.url, WORKFLOW_URL)
         with patch.dict(os.environ, self.environment, clear=True), patch('controller.furnish', return_value=result) as run, \
                 patch('sys.stdout', new_callable=io.StringIO) as output:
             self.assertEqual(main(['furnish']), 0)

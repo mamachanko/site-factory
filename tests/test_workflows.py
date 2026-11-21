@@ -14,8 +14,9 @@ def load(path):
 
 class WorkflowTests(unittest.TestCase):
     def test_all_workflows_parse_and_have_minimal_default_permissions(self):
-        paths = list(ROOT.glob('.github/workflows/*.yml')) + list(ROOT.glob('starter/.github/workflows/*.yml'))
-        self.assertEqual(len(paths), 5)
+        paths = list(ROOT.glob('.github/workflows/*.yml'))
+        self.assertEqual({path.name for path in paths}, {'ci.yml', 'furnish-site.yml'})
+        paths.append(ROOT / 'templates/deploy.yml')
         for path in paths:
             with self.subTest(path=path):
                 workflow = load(path)
@@ -28,42 +29,6 @@ class WorkflowTests(unittest.TestCase):
                             self.assertRegex(action, r'^[^@]+@[a-f0-9]{40}$')
                         if step.get('uses', '').startswith('actions/checkout@'):
                             self.assertEqual(step['with']['persist-credentials'], 'false')
-
-    def test_creation_is_manual_main_only_with_boolean_dry_run(self):
-        workflow = load(ROOT / '.github/workflows/create-site.yml')
-        self.assertEqual(list(workflow['on']), ['workflow_dispatch'])
-        inputs = workflow['on']['workflow_dispatch']['inputs']
-        self.assertEqual(set(inputs), {'repository_name', 'description', 'custom_domain', 'dry_run'})
-        self.assertEqual(inputs['repository_name']['required'], 'true')
-        self.assertEqual(inputs['dry_run']['default'], 'true')
-        self.assertEqual(inputs['dry_run']['type'], 'boolean')
-        plan = workflow['jobs']['plan']
-        create = workflow['jobs']['create']
-        self.assertIn("github.repository == 'mamachanko/site-factory'", plan['if'])
-        self.assertIn("github.ref == 'refs/heads/main'", plan['if'])
-        self.assertNotIn('environment', plan)
-        self.assertNotIn('secrets.', str(plan))
-        self.assertNotIn('create-github-app-token', str(plan))
-        self.assertEqual([step['run'] for step in plan['steps'] if 'run' in step], ['python3 scripts/factory.py plan'])
-        self.assertEqual(create['needs'], 'plan')
-        self.assertEqual(create['if'], '${{ !inputs.dry_run }}')
-        self.assertEqual(create['environment'], 'site-factory-live')
-        steps = create['steps']
-        tokens = [step for step in steps if 'create-github-app-token' in step.get('uses', '')]
-        self.assertEqual(len(tokens), 2)
-        for token in tokens:
-            self.assertEqual(token['with']['owner'], 'mamachanko')
-            self.assertEqual(token['with']['app-id'], '${{ vars.SITE_FACTORY_APP_ID }}')
-            self.assertEqual(token['with']['private-key'], '${{ secrets.SITE_FACTORY_APP_PRIVATE_KEY }}')
-        self.assertNotIn('repositories', tokens[0]['with'])
-        self.assertEqual(
-            {key: value for key, value in tokens[0]['with'].items() if key.startswith('permission-')},
-            {'permission-administration': 'write'},
-        )
-        self.assertEqual(tokens[1]['with']['repositories'], '${{ inputs.repository_name }}')
-        for step in plan['steps'] + steps:
-            # User expressions belong in env/structured action inputs, never shell code.
-            self.assertNotIn('${{ inputs.', step.get('run', ''))
 
     def test_furnish_uses_one_mobile_input_and_mints_a_token_for_that_repo(self):
         workflow = load(ROOT / '.github/workflows/furnish-site.yml')
@@ -80,9 +45,9 @@ class WorkflowTests(unittest.TestCase):
                           "github.triggering_actor == 'mamachanko'"):
             self.assertIn(condition, job['if'])
         steps = job['steps']
-        validate, = [step for step in steps if step.get('run') == 'python3 scripts/controller.py validate']
+        validate, = [step for step in steps if step.get('run') == 'python3 scripts/factory.py validate']
         token, = [step for step in steps if 'create-github-app-token' in step.get('uses', '')]
-        provision, = [step for step in steps if step.get('run') == 'python3 scripts/controller.py furnish']
+        provision, = [step for step in steps if step.get('run') == 'python3 scripts/factory.py furnish']
         self.assertLess(steps.index(validate), steps.index(token))
         self.assertLess(steps.index(token), steps.index(provision))
         repository = '${{ steps.' + validate['id'] + '.outputs.repository_name }}'
@@ -99,36 +64,32 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all('${{' not in step.get('run', '') for step in steps))
 
     def test_deployment_separates_unprivileged_checks_and_minimal_deploy(self):
-        workflow = load(ROOT / 'starter/.github/workflows/deploy.yml')
+        workflow = load(ROOT / 'templates/deploy.yml')
         self.assertEqual(workflow['on']['push']['branches'], ['main'])
-        self.assertIn('workflow_dispatch', workflow['on'])
+        self.assertEqual(set(workflow['on']), {'push', 'workflow_dispatch'})
         deploy = workflow['jobs']['deploy']
         self.assertEqual(deploy['permissions'], {'pages': 'write', 'id-token': 'write'})
-        self.assertEqual(deploy['needs'], 'check-and-upload')
+        self.assertEqual(deploy['needs'], 'upload')
         self.assertEqual(deploy['environment']['name'], 'github-pages')
-        self.assertEqual(workflow['jobs']['check-and-upload']['permissions'], {'contents': 'read', 'pages': 'read'})
-        steps = workflow['jobs']['check-and-upload']['steps']
+        self.assertEqual(workflow['jobs']['upload']['permissions'], {'contents': 'read', 'pages': 'read'})
+        steps = workflow['jobs']['upload']['steps']
         upload = next(step for step in steps if step.get('uses', '').startswith('actions/upload-pages-artifact@'))
         self.assertEqual(upload['with']['path'], 'site')
-        content = (ROOT / 'starter/.github/workflows/deploy.yml').read_text()
+        content = (ROOT / 'templates/deploy.yml').read_text()
         self.assertNotIn('secrets.', content)
         self.assertNotIn('enablement: true', content)
 
-    def test_pr_workflows_have_no_privileged_credentials(self):
-        for path in (ROOT / '.github/workflows/ci.yml', ROOT / 'starter/.github/workflows/ci.yml'):
-            workflow = load(path)
-            self.assertIn('pull_request', workflow['on'])
-            self.assertNotIn('pull_request_target', workflow['on'])
-            self.assertNotIn('secrets.', path.read_text())
-            self.assertNotIn('create-github-app-token', path.read_text())
+    def test_pr_workflow_has_no_privileged_credentials(self):
+        path = ROOT / '.github/workflows/ci.yml'
+        workflow = load(path)
+        self.assertIn('pull_request', workflow['on'])
+        self.assertNotIn('pull_request_target', workflow['on'])
+        self.assertNotIn('secrets.', path.read_text())
+        self.assertNotIn('create-github-app-token', path.read_text())
 
-    def test_pages_workflows_reject_symlinks_before_upload(self):
-        for path, job in (('templates/deploy.yml', 'upload'),
-                          ('starter/.github/workflows/deploy.yml', 'check-and-upload')):
-            with self.subTest(workflow=path):
-                self.assert_pages_upload(load(ROOT / path)['jobs'][job]['steps'])
-
-    def assert_pages_upload(self, steps):
+    def test_pages_workflow_rejects_symlinks_before_upload(self):
+        workflow = load(ROOT / 'templates/deploy.yml')
+        steps = workflow['jobs']['upload']['steps']
         check, = [step for step in steps if step.get('name') == 'Check site files']
         upload = next(step for step in steps if step.get('uses', '').startswith('actions/upload-pages-artifact@'))
         self.assertLess(steps.index(check), steps.index(upload))

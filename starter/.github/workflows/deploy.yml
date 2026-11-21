@@ -29,6 +29,14 @@ jobs:
       - run: node --check site/app.mjs
       - run: node --test tests/*.test.mjs
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - name: Check site files
+        shell: bash
+        run: |
+          link=$(find site -type l -print -quit)
+          if [[ -n "$link" ]]; then
+            echo "::error::Remove symbolic links from site/ before deploying to GitHub Pages."
+            exit 1
+          fi
       - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
           path: site

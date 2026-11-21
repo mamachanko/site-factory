@@ -36,6 +36,14 @@ class APIError(FactoryError):
         super().__init__(detail)
 
 
+def validate_domain(domain):
+    labels = domain.split(".")
+    if len(domain) > 253 or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", x) for x in labels):
+        raise FactoryError("Domain must be a lowercase DNS hostname, without scheme, port, path, or wildcard.")
+    if not any(domain == d or domain.endswith("." + d) for d in DOMAINS):
+        raise FactoryError("Domain must be mamachanko.com, maxbrauer.com, or one of their subdomains.")
+
+
 @dataclass(frozen=True)
 class Site:
     name: str
@@ -50,11 +58,7 @@ class Site:
         if len(self.description) > 350 or any(ord(c) < 32 or ord(c) == 127 for c in self.description):
             raise FactoryError("Description must be one line, at most 350 characters, without control characters.")
         if self.domain:
-            labels = self.domain.split(".")
-            if len(self.domain) > 253 or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", x) for x in labels):
-                raise FactoryError("Domain must be a lowercase DNS hostname, without scheme, port, path, or wildcard.")
-            if not any(self.domain == d or self.domain.endswith("." + d) for d in DOMAINS):
-                raise FactoryError("Domain must be mamachanko.com, maxbrauer.com, or one of their subdomains.")
+            validate_domain(self.domain)
 
     @property
     def repository(self):

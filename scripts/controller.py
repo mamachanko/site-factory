@@ -20,10 +20,6 @@ RULESET_NAME = "site-factory-main"
 SHA = re.compile(r"[0-9a-f]{40}")
 
 
-def parse_repository(value):
-    return factory.Site(value)
-
-
 def installation_repository(api, site):
     installation = api.request("GET", "/installation/repositories?per_page=2")
     if not isinstance(installation, dict):
@@ -44,14 +40,14 @@ def starter_files(site):
             WORKFLOW: (directory / "deploy.yml").read_text()}
 
 
-def target_repository(api, site, repository_id=None, *, require_main=True):
+def target_repository(api, site, repository_id, *, require_main=True):
     repo = api.request("GET", f"/repos/{site.repository}")
     if (not isinstance(repo, dict) or not isinstance(repo.get("owner"), dict)
             or repo.get("full_name") != site.repository or repo["owner"].get("login") != factory.OWNER
             or repo["owner"].get("type") != "User" or repo.get("private") is not False
             or repo.get("archived") is not False or repo.get("disabled") is not False
             or type(repo.get("id")) is not int or repo["id"] <= 0
-            or (repository_id is not None and repo["id"] != repository_id)):
+            or repo["id"] != repository_id):
         raise factory.FactoryError("Repository must be public, active, and owned by mamachanko; its ID must match the scoped App token.")
     if require_main and repo.get("default_branch") != "main":
         raise factory.FactoryError("The existing repository default branch must be main.")
@@ -111,7 +107,7 @@ def existing_ruleset(api, base):
     return rule
 
 
-def allowed_url(value):
+def validate_pages_url(value):
     if not isinstance(value, str):
         raise factory.FactoryError("Pages did not report a usable HTTPS URL.")
     parts = urllib.parse.urlsplit(value)
@@ -119,11 +115,10 @@ def allowed_url(value):
             or parts.port is not None or parts.query or parts.fragment or any(c.isspace() for c in value)):
         raise factory.FactoryError("Pages URL must be HTTPS on an allowed host.")
     if parts.hostname != f"{factory.OWNER}.github.io":
-        factory.Site("pages-check", domain=parts.hostname)
-    return value
+        factory.validate_domain(parts.hostname)
 
 
-def pages_state(api, base):
+def configured_pages_url(api, base):
     try:
         pages = api.request("GET", base + "/pages")
     except factory.APIError as error:
@@ -133,9 +128,10 @@ def pages_state(api, base):
     if pages.get("build_type") != "workflow":
         raise factory.FactoryError("Existing Pages must already use GitHub Actions; refusing to replace its source.")
     if pages.get("cname"):
-        factory.Site("pages-check", domain=pages["cname"])
-    allowed_url(pages.get("html_url"))
-    return pages
+        factory.validate_domain(pages["cname"])
+    url = pages.get("html_url")
+    validate_pages_url(url)
+    return url
 
 
 def seed_repository(site, files, token, *, remote=None, check=lambda: None, require_main_only=False):
@@ -210,11 +206,11 @@ def seed_repository(site, files, token, *, remote=None, check=lambda: None, requ
         return commit
 
 
-def live_url(url):
+def page_responds(url):
     """Fetch Pages without credentials, checking every redirect target."""
     opener = urllib.request.build_opener(factory.NoRedirect)
     for _ in range(6):
-        allowed_url(url)
+        validate_pages_url(url)
         try:
             with opener.open(urllib.request.Request(url, headers={"User-Agent": "site-factory"}), timeout=20) as response:
                 return response.status == 200
@@ -228,12 +224,12 @@ def live_url(url):
     raise factory.FactoryError("Pages redirected too many times.")
 
 
-def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=live_url, progress=lambda message: None):
+def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=page_responds, progress=lambda message: None):
     repository_id = installation_repository(api, site)
     base = f"/repos/{site.repository}"
     repo = target_repository(api, site, repository_id, require_main=False)
     needs_main = repo.get("default_branch") != "main"
-    pages = pages_state(api, base)
+    pages_url = configured_pages_url(api, base)
     rule = existing_ruleset(api, base)
     head = seed(site, starter_files(site), token,
                 check=lambda: target_repository(api, site, repository_id, require_main=not needs_main),
@@ -243,11 +239,11 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=li
     if repo.get("default_branch") != "main":
         api.request("PATCH", base, {"default_branch": "main"})
         target_repository(api, site, repository_id)
-    if pages is None:
+    if pages_url is None:
         target_repository(api, site, repository_id)
         api.request("POST", base + "/pages", {"build_type": "workflow"})
-        pages = pages_state(api, base)
-        if pages is None:
+        pages_url = configured_pages_url(api, base)
+        if pages_url is None:
             raise factory.FactoryError("Pages creation was not confirmed.")
     progress("GitHub Actions Pages confirmed")
     if rule is None:
@@ -289,19 +285,12 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=li
             raise factory.FactoryError(f"Deployment is still pending; inspect {run_url}.")
         sleep(5)
     for attempt in range(60):
-        pages = pages_state(api, base)
-        if pages is not None and live(pages["html_url"]):
-            return {"repository": site.repository, "workflow_url": run_url, "url": pages["html_url"],
-                    "head_sha": head, "run_id": run_id}
+        pages_url = configured_pages_url(api, base)
+        if pages_url is not None and live(pages_url):
+            return pages_url, run_url
         if attempt != 59:
             sleep(5)
     raise factory.FactoryError(f"Deployment succeeded but the Pages URL is not live yet; inspect {run_url} and Pages settings.")
-
-
-def summary(text):
-    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
-        with open(path, "a", encoding="utf-8") as output:
-            output.write(text + "\n")
 
 
 def main(argv=None):
@@ -310,7 +299,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     stage = None
     try:
-        site = parse_repository(os.environ.get("REPOSITORY_NAME", ""))
+        site = factory.Site(os.environ.get("REPOSITORY_NAME", ""))
         if args.command == "validate":
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
                 output.write(f"repository_name={site.name}\n")
@@ -320,9 +309,11 @@ def main(argv=None):
             nonlocal stage
             stage = message
             print(message, flush=True)
-        result = furnish(api, site, api.token, progress=progress)
-        summary(f"Repository: https://github.com/{result['repository']}\n\nLive: {result['url']}")
-        print(f"Live: {result['url']}\nRepository: https://github.com/{result['repository']}\nDeployment: {result['workflow_url']}")
+        pages_url, run_url = furnish(api, site, api.token, progress=progress)
+        if path := os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(path, "a", encoding="utf-8") as output:
+                output.write(f"Repository: https://github.com/{site.repository}\n\nLive: {pages_url}\n")
+        print(f"Live: {pages_url}\nRepository: https://github.com/{site.repository}\nDeployment: {run_url}")
         return 0
     except (factory.FactoryError, OSError, ValueError, KeyError) as error:
         detail = str(error) if isinstance(error, factory.FactoryError) else "Local state or response validation failed."

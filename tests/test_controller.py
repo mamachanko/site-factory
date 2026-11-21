@@ -1,16 +1,18 @@
 from copy import deepcopy
 from pathlib import Path
+import io
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from controller import furnish, parse_repository, ruleset_payload, seed_repository
+from controller import furnish, main, parse_repository, ruleset_payload, seed_repository
 from factory import APIError, FactoryError
 
 
@@ -27,9 +29,10 @@ class FurnishTests(unittest.TestCase):
         self.repo = {
             'id': 42, 'full_name': SITE.repository, 'private': False,
             'visibility': 'public', 'archived': False, 'disabled': False,
-            'default_branch': 'main', 'permissions': {'admin': True},
+            'default_branch': 'main',
             'owner': {'login': 'mamachanko', 'type': 'User'},
         }
+        self.installation = {'total_count': 1, 'repositories': [{'id': 42, 'full_name': SITE.repository}]}
         self.pages = None
         self.rule = None
         self.conclusion = 'success'
@@ -40,9 +43,9 @@ class FurnishTests(unittest.TestCase):
         self.api.request.side_effect = self.request
 
     def request(self, method, path, payload=None):
+        if method == 'GET' and path == '/installation/repositories?per_page=2':
+            return deepcopy(self.installation)
         path = path.partition('?')[0]
-        if method == 'GET' and path == '/user':
-            return {'login': 'mamachanko', 'type': 'User'}
         if method == 'GET' and path == REPO:
             return deepcopy(self.repo)
         if method == 'PATCH' and path == REPO:
@@ -131,14 +134,67 @@ class FurnishTests(unittest.TestCase):
                 self.seed.assert_not_called()
                 self.assertTrue(all(call.args[0] == 'GET' for call in self.api.request.call_args_list))
 
-    def test_target_formats_and_foreign_account(self):
+    def test_only_canonical_bare_names_are_accepted(self):
         self.assertEqual(parse_repository('my-site'), SITE)
-        self.assertEqual(parse_repository(SITE.repository), SITE)
-        self.assertEqual(parse_repository(REPO_URL), SITE)
-        for value in ('someone/my-site', 'https://example.com/' + SITE.repository,
-                      REPO_URL + '/settings'):
+        for value in (SITE.repository, REPO_URL, 'someone/my-site', 'My-site', 'my_site',
+                      'my--site', '-site', 'site-', 'site-factory', 'a' * 64, '',
+                      'site,other', 'site\nother', 'site\r', 'site%0aother', 'site ',
+                      '${{ secrets.KEY }}', '$(touch /tmp/site-factory-bug)', 'é'):
             with self.subTest(value=value), self.assertRaises(FactoryError):
                 parse_repository(value)
+
+    def test_token_scope_must_bind_exactly_one_requested_repository(self):
+        invalid = [None, {}, {'total_count': 0, 'repositories': []},
+                   {'total_count': 2, 'repositories': self.installation['repositories']},
+                   {'total_count': True, 'repositories': self.installation['repositories']},
+                   {'total_count': 1, 'repositories': []},
+                   {'total_count': 1, 'repositories': [None]},
+                   {'total_count': 1, 'repositories': [{'full_name': 'mamachanko/other', 'id': 42}]},
+                   {'total_count': 1, 'repositories': [{'full_name': SITE.repository, 'id': True}]},
+                   {'total_count': 1, 'repositories': [{'full_name': SITE.repository, 'id': 0}]},
+                   {'total_count': 1, 'repositories': [{'full_name': SITE.repository, 'id': '42'}]},
+                   {'total_count': 1, 'repositories': [{'full_name': SITE.repository, 'id': 43}]}]
+        for installation in invalid:
+            with self.subTest(installation=installation):
+                self.installation = installation
+                self.api.reset_mock()
+                with self.assertRaises(FactoryError):
+                    self.run_furnish()
+                self.seed.assert_not_called()
+                self.assertTrue(all(call.args[0] == 'GET' for call in self.api.request.call_args_list))
+
+    def test_target_identity_and_active_public_owner_are_required(self):
+        original = deepcopy(self.repo)
+        for changes in ({'full_name': 'mamachanko/other'}, {'id': True}, {'id': 43},
+                        {'owner': {'login': 'someone', 'type': 'User'}},
+                        {'owner': {'login': 'mamachanko', 'type': 'Organization'}},
+                        {'private': True}, {'archived': True}, {'disabled': True}):
+            with self.subTest(changes=changes):
+                self.repo = {**original, **changes}
+                self.api.reset_mock()
+                with self.assertRaises(FactoryError):
+                    self.run_furnish()
+                self.seed.assert_not_called()
+                self.assertTrue(all(call.args[0] == 'GET' for call in self.api.request.call_args_list))
+
+    def test_identity_is_checked_again_before_every_api_write(self):
+        self.run_furnish()
+        calls = [call.args for call in self.api.request.call_args_list]
+        for index, (method, *_rest) in enumerate(calls):
+            if method != 'GET':
+                self.assertEqual(calls[index - 1], ('GET', REPO))
+        self.assertEqual(calls[0], ('GET', '/installation/repositories?per_page=2'))
+        self.assertNotIn(('GET', '/user'), calls)
+
+    def test_identity_change_during_git_preparation_prevents_push(self):
+        def changed_repository(*args, **kwargs):
+            self.repo['id'] = 43
+            kwargs['check']()
+            self.fail('Changed repository must not pass the Git pre-push check')
+        self.seed.side_effect = changed_repository
+        with self.assertRaises(FactoryError):
+            self.run_furnish()
+        self.assertTrue(all(call.args[0] == 'GET' for call in self.api.request.call_args_list))
 
     def test_private_repo_is_rejected_before_seed(self):
         self.repo['private'] = True
@@ -164,6 +220,50 @@ class FurnishTests(unittest.TestCase):
         with self.assertRaisesRegex(FactoryError, 'Deployment failed'):
             self.run_furnish()
         self.live.assert_not_called()
+
+
+class RunnerCommandTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.output = Path(temporary.name) / 'output'
+        self.summary = Path(temporary.name) / 'summary'
+        self.environment = {'REPOSITORY_NAME': SITE.name, 'GITHUB_OUTPUT': str(self.output),
+                            'GITHUB_STEP_SUMMARY': str(self.summary), 'GH_TOKEN': 'secret-test-token'}
+
+    def test_validation_exports_only_the_canonical_name_without_authentication(self):
+        with patch.dict(os.environ, self.environment, clear=True), patch('controller.factory.GitHub') as api:
+            self.assertEqual(main(['validate']), 0)
+        self.assertEqual(self.output.read_text(), 'repository_name=my-site\n')
+        self.assertFalse(self.summary.exists())
+        api.assert_not_called()
+
+    def test_invalid_input_never_produces_action_output_or_requests_credentials(self):
+        for value in ('site,other', 'site\nrepository_name=other', SITE.repository, REPO_URL, ''):
+            with self.subTest(value=value), patch.dict(os.environ, {**self.environment, 'REPOSITORY_NAME': value}, clear=True), \
+                    patch('controller.factory.GitHub') as api, patch('sys.stderr', new_callable=io.StringIO):
+                self.assertEqual(main(['validate']), 1)
+                self.assertFalse(self.output.exists())
+                api.assert_not_called()
+
+    def test_furnish_uses_environment_app_token_and_reports_verified_result(self):
+        result = {'repository': SITE.repository, 'url': SITE.url, 'workflow_url': WORKFLOW_URL}
+        with patch.dict(os.environ, self.environment, clear=True), patch('controller.furnish', return_value=result) as run, \
+                patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.assertEqual(main(['furnish']), 0)
+        self.assertEqual(run.call_args.args[0].token, 'secret-test-token')
+        self.assertEqual(run.call_args.args[2], 'secret-test-token')
+        self.assertEqual(self.summary.read_text(), f'Repository: {REPO_URL}\n\nLive: {SITE.url}\n')
+        self.assertNotIn('secret-test-token', output.getvalue() + self.summary.read_text())
+
+    def test_failure_and_missing_token_never_report_success_links(self):
+        for token in ('secret-test-token', ''):
+            with self.subTest(token=token), patch.dict(os.environ, {**self.environment, 'GH_TOKEN': token}, clear=True), \
+                    patch('controller.furnish', side_effect=FactoryError('Deployment failed')), \
+                    patch('sys.stderr', new_callable=io.StringIO) as output:
+                self.assertEqual(main(['furnish']), 1)
+                self.assertFalse(self.summary.exists())
+                self.assertNotIn('secret-test-token', output.getvalue())
 
 
 class SeedTests(unittest.TestCase):

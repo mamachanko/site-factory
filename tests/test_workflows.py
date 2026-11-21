@@ -122,9 +122,13 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn('secrets.', path.read_text())
             self.assertNotIn('create-github-app-token', path.read_text())
 
-    def test_furnished_deployment_rejects_symlinks_before_upload(self):
-        workflow = load(ROOT / 'templates/deploy.yml')
-        steps = workflow['jobs']['upload']['steps']
+    def test_pages_workflows_reject_symlinks_before_upload(self):
+        for path, job in (('templates/deploy.yml', 'upload'),
+                          ('starter/.github/workflows/deploy.yml', 'check-and-upload')):
+            with self.subTest(workflow=path):
+                self.assert_pages_upload(load(ROOT / path)['jobs'][job]['steps'])
+
+    def assert_pages_upload(self, steps):
         check, = [step for step in steps if step.get('name') == 'Check site files']
         upload = next(step for step in steps if step.get('uses', '').startswith('actions/upload-pages-artifact@'))
         self.assertLess(steps.index(check), steps.index(upload))

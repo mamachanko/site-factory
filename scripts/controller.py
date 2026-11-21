@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Furnish an existing personal repository using the stored GitHub CLI login."""
+"""Validate or furnish an owner-created repository from the trusted App workflow."""
 import argparse
 import html
 import os
@@ -21,28 +21,21 @@ SHA = re.compile(r"[0-9a-f]{40}")
 
 
 def parse_repository(value):
-    if value.startswith("https://github.com/"):
-        value = value[len("https://github.com/"):].removesuffix("/").removesuffix(".git")
-    if "/" in value:
-        owner, value = value.split("/", 1)
-        if owner != factory.OWNER:
-            raise factory.FactoryError(f"Repository must belong to {factory.OWNER}.")
     return factory.Site(value)
 
 
-def stored_token():
-    env = {k: v for k, v in os.environ.items()
-           if k not in {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST"}}
-    env["GH_PROMPT_DISABLED"] = "1"
-    try:
-        result = subprocess.run(["gh", "auth", "token", "--hostname", "github.com"],
-                                env=env, check=True, capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        raise factory.FactoryError("A stored github.com login is required; run gh auth login first.") from None
-    token = result.stdout.strip()
-    if not token or any(c.isspace() for c in token):
-        raise factory.FactoryError("GitHub CLI did not return a usable stored login.")
-    return token
+def installation_repository(api, site):
+    installation = api.request("GET", "/installation/repositories?per_page=2")
+    if not isinstance(installation, dict):
+        raise factory.FactoryError("The App token must cover exactly the requested repository.")
+    repositories = installation.get("repositories")
+    if (type(installation.get("total_count")) is not int or installation["total_count"] != 1
+            or not isinstance(repositories, list) or len(repositories) != 1
+            or not isinstance(repositories[0], dict)
+            or repositories[0].get("full_name") != site.repository
+            or type(repositories[0].get("id")) is not int or repositories[0]["id"] <= 0):
+        raise factory.FactoryError("The App token must cover exactly the requested repository.")
+    return repositories[0]["id"]
 
 
 def starter_files(site):
@@ -53,13 +46,13 @@ def starter_files(site):
 
 def target_repository(api, site, repository_id=None, *, require_main=True):
     repo = api.request("GET", f"/repos/{site.repository}")
-    if (repo.get("full_name") != site.repository or repo.get("owner", {}).get("login") != factory.OWNER
-            or repo.get("owner", {}).get("type") != "User" or repo.get("private") is not False
+    if (not isinstance(repo, dict) or not isinstance(repo.get("owner"), dict)
+            or repo.get("full_name") != site.repository or repo["owner"].get("login") != factory.OWNER
+            or repo["owner"].get("type") != "User" or repo.get("private") is not False
             or repo.get("archived") is not False or repo.get("disabled") is not False
-            or repo.get("permissions", {}).get("admin") is not True
-            or not isinstance(repo.get("id"), int)
+            or type(repo.get("id")) is not int or repo["id"] <= 0
             or (repository_id is not None and repo["id"] != repository_id)):
-        raise factory.FactoryError("Repository must be public, active, admin-accessible, and owned by mamachanko; identity must remain unchanged.")
+        raise factory.FactoryError("Repository must be public, active, and owned by mamachanko; its ID must match the scoped App token.")
     if require_main and repo.get("default_branch") != "main":
         raise factory.FactoryError("The existing repository default branch must be main.")
     return repo
@@ -236,12 +229,9 @@ def live_url(url):
 
 
 def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=live_url, progress=lambda message: None):
-    user = api.request("GET", "/user")
-    if user.get("login") != factory.OWNER or user.get("type") != "User":
-        raise factory.FactoryError("The stored GitHub CLI login must be mamachanko's personal account.")
+    repository_id = installation_repository(api, site)
     base = f"/repos/{site.repository}"
-    repo = target_repository(api, site, require_main=False)
-    repository_id = repo["id"]
+    repo = target_repository(api, site, repository_id, require_main=False)
     needs_main = repo.get("default_branch") != "main"
     pages = pages_state(api, base)
     rule = existing_ruleset(api, base)
@@ -254,12 +244,14 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=li
         api.request("PATCH", base, {"default_branch": "main"})
         target_repository(api, site, repository_id)
     if pages is None:
+        target_repository(api, site, repository_id)
         api.request("POST", base + "/pages", {"build_type": "workflow"})
         pages = pages_state(api, base)
         if pages is None:
             raise factory.FactoryError("Pages creation was not confirmed.")
     progress("GitHub Actions Pages confirmed")
     if rule is None:
+        target_repository(api, site, repository_id)
         created = api.request("POST", base + "/rulesets", ruleset_payload())
         if not compatible_ruleset(created):
             raise factory.FactoryError("Created main ruleset was not confirmed; inspect GitHub.")
@@ -276,6 +268,7 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=li
     if workflow.get("path") != WORKFLOW or workflow.get("state") != "active":
         raise factory.FactoryError("The exact deployment workflow is not active.")
     # The versioned dispatch response identifies this run directly. Never guess from a run list.
+    target_repository(api, site, repository_id)
     run = api.request("POST", workflow_path + "/dispatches", {"ref": "main"})
     run_id = run.get("workflow_run_id") if isinstance(run, dict) else None
     if type(run_id) is not int or run_id <= 0:
@@ -305,20 +298,30 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=li
     raise factory.FactoryError(f"Deployment succeeded but the Pages URL is not live yet; inspect {run_url} and Pages settings.")
 
 
+def summary(text):
+    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(path, "a", encoding="utf-8") as output:
+            output.write(text + "\n")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("furnish",))
-    parser.add_argument("repository", help="name, mamachanko/name, or GitHub URL")
+    parser.add_argument("command", choices=("validate", "furnish"))
     args = parser.parse_args(argv)
     stage = None
     try:
-        site = parse_repository(args.repository)
-        token = stored_token()
+        site = parse_repository(os.environ.get("REPOSITORY_NAME", ""))
+        if args.command == "validate":
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                output.write(f"repository_name={site.name}\n")
+            return 0
+        api = factory.GitHub()
         def progress(message):
             nonlocal stage
             stage = message
             print(message, flush=True)
-        result = furnish(factory.GitHub(token=token), site, token, progress=progress)
+        result = furnish(api, site, api.token, progress=progress)
+        summary(f"Repository: https://github.com/{result['repository']}\n\nLive: {result['url']}")
         print(f"Live: {result['url']}\nRepository: https://github.com/{result['repository']}\nDeployment: {result['workflow_url']}")
         return 0
     except (factory.FactoryError, OSError, ValueError, KeyError) as error:

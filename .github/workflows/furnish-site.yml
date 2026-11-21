@@ -1,0 +1,63 @@
+name: Furnish site
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_name:
+        description: Existing public repository name (lowercase letters, digits, single hyphens; max 63)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  furnish:
+    if: github.repository == 'mamachanko/site-factory' && github.ref == 'refs/heads/main' && github.actor == 'mamachanko' && github.triggering_actor == 'mamachanko'
+    environment: site-factory-live
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: site-factory-furnish-${{ inputs.repository_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+      - name: Validate the repository name before requesting credentials
+        id: validate
+        env:
+          REPOSITORY_NAME: ${{ inputs.repository_name }}
+        run: python3 scripts/controller.py validate
+      - name: Mint an App token for only the validated repository
+        id: furnish-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
+        with:
+          app-id: ${{ vars.SITE_FACTORY_APP_ID }}
+          private-key: ${{ secrets.SITE_FACTORY_APP_PRIVATE_KEY }}
+          owner: mamachanko
+          repositories: ${{ steps.validate.outputs.repository_name }}
+          permission-administration: write
+          permission-contents: write
+          permission-workflows: write
+          permission-pages: write
+          permission-actions: write
+      - name: Furnish the repository and verify its live deployment
+        env:
+          REPOSITORY_NAME: ${{ steps.validate.outputs.repository_name }}
+          GH_TOKEN: ${{ steps.furnish-token.outputs.token }}
+        run: python3 scripts/controller.py furnish
+      - name: Report workflow-level failure
+        if: failure()
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## Furnishing stopped
+
+          Open the failed step for details. If token creation failed, check that the factory App can access the public repository under mamachanko.
+
+          Fix the problem, then run Furnish site again with the same repository name.
+          SUMMARY

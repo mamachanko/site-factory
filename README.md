@@ -2,18 +2,17 @@
 
 ## Start a new site
 
-1. Create a public repository under `mamachanko` on GitHub. You can leave it empty or start from a template with `main` as its default branch.
-2. Run this from your site-factory checkout, using the name of your new repository.
+1. Create a public repository under `mamachanko` in the GitHub app or browser. Leave it empty or use a template with `main` as its default branch.
+2. In GitHub Mobile, open **site-factory → Actions → Workflows → Furnish site**. Tap **Run workflow**, enter the repository name, and submit. You can also open [Furnish site in your browser](https://github.com/mamachanko/site-factory/actions/workflows/furnish-site.yml).
+3. Open the finished run. Copy the repository URL from its summary and give it to Codex. Ask Codex to build in `site/` and open a pull request. Merging the pull request publishes changes to the Pages URL in the same summary.
 
-   ```sh
-   python3 scripts/controller.py furnish my-site
-   ```
+Furnish site adds a starter page and deployment workflow where missing, enables Pages, and requires pull requests on `main`. You can rerun it after fixing a failed step.
 
-   On first use, sign in to GitHub CLI as `mamachanko` with `gh auth login --hostname github.com`. Grant workflow access with `gh auth refresh --hostname github.com --scopes workflow`.
+### First use
 
-3. Give Codex the repository URL printed by the command. Ask it to build in `site/` and open a pull request. Merge the pull request to publish the changes at the printed Pages URL.
+If the factory's GitHub App is already installed, open its configuration and select **All repositories** once. This gives the App access to repositories you create. Each Furnish site run gets a token limited to the repository you enter. [Manage installed GitHub Apps](https://github.com/settings/installations)
 
-The command fills in a starter page and a deployment workflow, enables GitHub Pages, and protects `main`. It waits for the first deployment. You can run it again after fixing a failed setup step.
+For a new installation, follow the [GitHub App setup](#one-time-github-app-setup).
 
 ## Create a site with the GitHub App
 
@@ -26,7 +25,8 @@ Launch an independent, public GitHub Pages website in `mamachanko`'s personal ac
 ```text
 site-factory/
 ├── .github/workflows/
-│   ├── create-site.yml       Manual factory, main branch only
+│   ├── furnish-site.yml      Set up an existing site repository
+│   ├── create-site.yml       Create and populate a repository
 │   └── ci.yml                Unprivileged factory tests on PRs and main
 ├── scripts/factory.py        Validation, rendering, REST API, safe Git push, reporting
 ├── starter/                  Everything copied into a new repository
@@ -72,7 +72,7 @@ Only `site/` is uploaded to Pages. Source guidance, tests, scripts, and workflow
 
    Do not grant unrelated permissions, account permissions, or a classic PAT.
 4. Create the App. Copy its **App ID** and generate a **private key**. Keep the downloaded PEM private.
-5. Under Install App, install it on **mamachanko**, choose **Only select repositories**, and select **site-factory**. If permissions are later changed, approve the updated installation permissions too.
+5. Under **Install App**, install it on **mamachanko** and choose **All repositories**. This includes repositories you create later. If App permissions change, approve the update in the installation.
 6. In **site-factory → Settings → Environments**, create `site-factory-live`. Under **Deployment branches and tags**, choose **Selected branches and tags** and add a **Branch** rule for `main`. Then add an **Environment secret** named `SITE_FACTORY_APP_PRIVATE_KEY` with the entire PEM, including header/footer and line breaks. If upgrading an existing setup, remove the repository-level copy of the secret after setting up the restricted environment.
 7. In **site-factory → Settings → Secrets and variables → Actions → Variables**, add the App's numeric ID as the repository variable `SITE_FACTORY_APP_ID`.
 
@@ -80,7 +80,7 @@ Only `site/` is uploaded to Pages. Source guidance, tests, scripts, and workflow
 
 GitHub grants an App access to repositories it creates, even with a selected-repositories installation. The first token uses hardcoded `owner: mamachanko`, covers the installation, and requests only Administration write in addition to implicit Metadata read. After creation, a second `actions/create-github-app-token` step mints a fresh token scoped to the new repository with the permissions needed to populate and deploy it. Both tokens are short-lived and revoked by the action's default post-job cleanup.
 
-The workflow runs only from `main` in `mamachanko/site-factory`. The plan job runs before live creation and can run without the environment configured. Only the live job uses `site-factory-live`. Restrict write access and protect `main` to control changes to code that receives the App credentials. PR CI uses a read-only `GITHUB_TOKEN` and receives no App credentials. Generated sites use their own `GITHUB_TOKEN`, with `pages: write` and `id-token: write` in the deployment job and `contents: read` and `pages: read` in the check-and-upload job.
+The workflow runs only from `main` in `mamachanko/site-factory`. The plan job runs before live creation and can run without the environment configured. Create site uses `site-factory-live` for its live job. Furnish site uses the same environment. Restrict write access and protect `main` to control changes to code that receives the App credentials. PR CI uses a read-only `GITHUB_TOKEN` and receives no App credentials. Generated sites use their own `GITHUB_TOKEN`, with `pages: write` and `id-token: write` in the deployment job and `contents: read` and `pages: read` in the check-and-upload job.
 
 ## Verify domains before first use
 

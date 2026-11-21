@@ -13,7 +13,7 @@ def load(path):
 class WorkflowTests(unittest.TestCase):
     def test_all_workflows_parse_and_have_minimal_default_permissions(self):
         paths = list(ROOT.glob('.github/workflows/*.yml')) + list(ROOT.glob('starter/.github/workflows/*.yml'))
-        self.assertEqual(len(paths), 4)
+        self.assertEqual(len(paths), 5)
         for path in paths:
             with self.subTest(path=path):
                 workflow = load(path)
@@ -62,6 +62,39 @@ class WorkflowTests(unittest.TestCase):
         for step in plan['steps'] + steps:
             # User expressions belong in env/structured action inputs, never shell code.
             self.assertNotIn('${{ inputs.', step.get('run', ''))
+
+    def test_furnish_uses_one_mobile_input_and_mints_a_token_for_that_repo(self):
+        workflow = load(ROOT / '.github/workflows/furnish-site.yml')
+        self.assertEqual(workflow['name'], 'Furnish site')
+        self.assertEqual(list(workflow['on']), ['workflow_dispatch'])
+        inputs = workflow['on']['workflow_dispatch']['inputs']
+        self.assertEqual(set(inputs), {'repository_name'})
+        self.assertEqual(inputs['repository_name']['required'], 'true')
+        self.assertEqual(inputs['repository_name']['type'], 'string')
+        job, = workflow['jobs'].values()
+        self.assertEqual(job['environment'], 'site-factory-live')
+        for condition in ("github.repository == 'mamachanko/site-factory'",
+                          "github.ref == 'refs/heads/main'", "github.actor == 'mamachanko'",
+                          "github.triggering_actor == 'mamachanko'"):
+            self.assertIn(condition, job['if'])
+        steps = job['steps']
+        validate, = [step for step in steps if step.get('run') == 'python3 scripts/controller.py validate']
+        token, = [step for step in steps if 'create-github-app-token' in step.get('uses', '')]
+        provision, = [step for step in steps if step.get('run') == 'python3 scripts/controller.py furnish']
+        self.assertLess(steps.index(validate), steps.index(token))
+        self.assertLess(steps.index(token), steps.index(provision))
+        repository = '${{ steps.' + validate['id'] + '.outputs.repository_name }}'
+        self.assertEqual(validate['env']['REPOSITORY_NAME'], '${{ inputs.repository_name }}')
+        self.assertEqual(token['with']['owner'], 'mamachanko')
+        self.assertEqual(token['with']['repositories'], repository)
+        self.assertEqual({key: value for key, value in token['with'].items() if key.startswith('permission-')},
+                         {'permission-' + name: 'write' for name in
+                          ('administration', 'contents', 'workflows', 'pages', 'actions')})
+        self.assertEqual(provision['env'], {
+            'REPOSITORY_NAME': repository,
+            'GH_TOKEN': '${{ steps.' + token['id'] + '.outputs.token }}',
+        })
+        self.assertTrue(all('${{' not in step.get('run', '') for step in steps))
 
     def test_deployment_separates_unprivileged_checks_and_minimal_deploy(self):
         workflow = load(ROOT / 'starter/.github/workflows/deploy.yml')

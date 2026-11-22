@@ -1,0 +1,67 @@
+name: Deploy to GitHub Pages
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    name: Check site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the exact public commit without credentials
+        shell: bash
+        run: |
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+          git -c core.hooksPath=/dev/null init .
+          git -c credential.helper= -c http.extraheader= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Check site files
+        run: bash scripts/check-site.sh
+  upload:
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - name: Check out the exact public commit without credentials
+        shell: bash
+        run: |
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+          git -c core.hooksPath=/dev/null init .
+          git -c credential.helper= -c http.extraheader= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - run: bash scripts/check-site.sh
+      - uses: ./.github/actions/upload-site
+  deploy:
+    needs: [check, upload]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out the exact public commit without credentials
+        shell: bash
+        run: |
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+          git -c core.hooksPath=/dev/null init .
+          git -c credential.helper= -c http.extraheader= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Deploy
+        id: deployment
+        uses: ./.github/actions/deploy-site

@@ -4,4 +4,4 @@ Read README.md before changing authentication, repository setup, or workflows. K
 
 Furnish site runs on `main` in `mamachanko/site-factory`. It uses a GitHub App token scoped to the named repository. Keep App credentials out of PR workflows. Preserve existing site files, normal Git pushes, and safe retries.
 
-Use Python 3.12+, Git, and GitHub CLI. Install test dependencies with `python3 -m pip install -r requirements-dev.txt`. Run `python3 -m unittest discover -s tests -v` and `actionlint .github/workflows/*.yml templates/deploy.yml`. Tests must use mocked GitHub responses or local Git repositories.
+Use Python 3.12+, Git, and GitHub CLI. Install test dependencies with `python3 -m pip install -r requirements-dev.txt`. Run `python3 -m unittest discover -s tests -v` and `actionlint .github/workflows/*.yml templates/.github/workflows/*.yml`. Tests must use mocked GitHub responses or local Git repositories.

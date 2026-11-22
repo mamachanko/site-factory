@@ -31,11 +31,11 @@ To install the App for the first time:
 
 Furnish site runs from `main` in `mamachanko/site-factory` when triggered by `mamachanko`. Keep `main` protected to control which code can use the App key.
 
-## Use your own domain
+## Site URLs
 
-A custom domain on the account's GitHub Pages user site also applies to project sites. For example, a project named `my-site` can appear at `https://mamachanko.com/my-site/`. [GitHub Pages custom domains](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/about-custom-domains-and-github-pages#using-a-custom-domain-across-multiple-repositories)
+GitHub Pages serves project sites at `https://gh.mamachanko.com/<repo>/` through the account's user site. Furnish site uses that URL in the starter README and checks it over HTTPS before reporting it in the run summary. [GitHub Pages shared domains](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/about-custom-domains-and-github-pages#using-a-custom-domain-across-multiple-repositories)
 
-To give one project a different hostname, verify the domain on GitHub, then configure the project's **Settings → Pages** and its DNS. Furnish site preserves existing Pages domains under `mamachanko.com` and `maxbrauer.com`. [Configure a Pages custom domain](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/managing-a-custom-domain-for-your-github-pages-site)
+If a repo already has its own Pages domain under `mamachanko.com` or `maxbrauer.com`, Furnish site uses that domain for its link and HTTPS check. [GitHub Pages custom domains](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/managing-a-custom-domain-for-your-github-pages-site)
 
 ## Develop site-factory
 

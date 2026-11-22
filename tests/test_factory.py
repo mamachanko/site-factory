@@ -19,7 +19,7 @@ from factory import (APIError, FactoryError, GitHub, Site, furnish, main, page_r
 
 
 SITE = Site('my-site')
-SITE_URL = f'https://mamachanko.github.io/{SITE.name}/'
+SITE_URL = f'https://gh.mamachanko.com/{SITE.name}/'
 REPO = f'/repos/{SITE.repository}'
 REPO_URL = f'https://github.com/{SITE.repository}'
 WORKFLOW = '.github/workflows/deploy.yml'
@@ -58,7 +58,7 @@ class FurnishTests(unittest.TestCase):
         self.api = Mock()
         self.api.request.side_effect = self.request
         starter_patch = patch('factory.starter_files', return_value=STARTER_FILES)
-        starter_patch.start()
+        self.starter = starter_patch.start()
         self.addCleanup(starter_patch.stop)
 
     def request(self, method, path, payload=None):
@@ -88,7 +88,8 @@ class FurnishTests(unittest.TestCase):
             return self.pages
         if method == 'POST' and path == REPO + '/pages':
             self.assertEqual(payload, {'build_type': 'workflow'})
-            self.pages = {**payload, 'html_url': SITE_URL, 'cname': None, 'public': True, 'status': 'built'}
+            self.pages = {**payload, 'html_url': f'http://mamachanko.github.io/{SITE.name}/',
+                          'cname': None, 'public': True, 'status': 'built'}
             return self.pages
         if method == 'GET' and path == REPO + '/rulesets':
             return [deepcopy(rule) for rule in [self.rule, self.integrity_rule, *self.other_rules] if rule]
@@ -312,12 +313,48 @@ class FurnishTests(unittest.TestCase):
             self.run_furnish()
         self.seed.assert_not_called()
 
-    def test_existing_custom_pages_url_is_verified(self):
-        url = 'https://maxbrauer.com/my-site/'
-        self.pages = {'build_type': 'workflow', 'html_url': url, 'cname': None}
-        result = self.run_furnish()
-        self.assertEqual(result, (url, WORKFLOW_URL))
-        self.live.assert_called_once_with(url)
+    def test_new_repository_readme_uses_the_shared_host_before_pages_exists(self):
+        self.starter.side_effect = starter_files
+        self.assertIsNone(self.pages)
+        self.assertEqual(self.run_furnish(), (SITE_URL, WORKFLOW_URL))
+        self.assertIn(f'[Open the site]({SITE_URL})', self.seed.call_args.args[1]['README.md'])
+        self.live.assert_called_once_with(SITE_URL)
+
+    def test_shared_host_ignores_legacy_pages_url_metadata(self):
+        for metadata in ({}, {'cname': None}, {'cname': 'gh.mamachanko.com'}):
+            for html_url in (None, f'http://mamachanko.github.io/{SITE.name}/',
+                             f'http://gh.mamachanko.com/{SITE.name}/', 'https://gh.mamachanko.com/'):
+                with self.subTest(metadata=metadata, html_url=html_url):
+                    self.pages = {'build_type': 'workflow', 'html_url': html_url, **metadata}
+                    self.live.reset_mock()
+                    self.assertEqual(self.run_furnish(), (SITE_URL, WORKFLOW_URL))
+                    self.starter.assert_called_with(SITE, SITE_URL)
+                    self.live.assert_called_once_with(SITE_URL)
+
+    def test_existing_custom_domain_is_used_for_readme_and_verification(self):
+        self.starter.side_effect = starter_files
+        for domain in ('maxbrauer.com', 'my-site.mamachanko.com'):
+            with self.subTest(domain=domain):
+                url = f'https://{domain}/'
+                self.pages = {'build_type': 'workflow', 'html_url': f'http://{domain}/', 'cname': domain}
+                self.live.reset_mock()
+                self.assertEqual(self.run_furnish(), (url, WORKFLOW_URL))
+                self.assertIn(f'[Open the site]({url})', self.seed.call_args.args[1]['README.md'])
+                self.live.assert_called_once_with(url)
+                self.assertFalse(any(call.args[:2] == ('POST', REPO + '/pages')
+                                     for call in self.api.request.call_args_list))
+
+    def test_unsupported_custom_domain_stops_before_mutation(self):
+        for domain in ('example.org', 'mamachanko.com.example.org', 'https://maxbrauer.com',
+                       'gh.mamachanko.com/path', '', False):
+            with self.subTest(domain=domain):
+                self.pages = {'build_type': 'workflow', 'html_url': SITE_URL, 'cname': domain}
+                self.api.reset_mock()
+                with self.assertRaises(FactoryError):
+                    self.run_furnish()
+                self.seed.assert_not_called()
+                self.live.assert_not_called()
+                self.assertTrue(all(call.args[0] == 'GET' for call in self.api.request.call_args_list))
 
     def test_successful_workflow_with_unreachable_page_fails(self):
         self.live.return_value = False
@@ -337,14 +374,16 @@ class FurnishTests(unittest.TestCase):
         self.live.assert_not_called()
 
     def test_off_allowlist_redirect_is_rejected_before_fetching_its_target(self):
-        opener = Mock()
-        opener.open.side_effect = urllib.error.HTTPError(
-            SITE_URL, 302, 'Found', {'Location': 'https://example.org/'}, None)
-        with patch('factory.urllib.request.build_opener', return_value=opener):
-            with self.assertRaises(FactoryError):
-                page_responds(SITE_URL)
-        opener.open.assert_called_once()
-        self.assertEqual(opener.open.call_args.args[0].full_url, SITE_URL)
+        for target in ('https://example.org/', f'http://gh.mamachanko.com/{SITE.name}/'):
+            with self.subTest(target=target):
+                opener = Mock()
+                opener.open.side_effect = urllib.error.HTTPError(
+                    SITE_URL, 302, 'Found', {'Location': target}, None)
+                with patch('factory.urllib.request.build_opener', return_value=opener):
+                    with self.assertRaises(FactoryError):
+                        page_responds(SITE_URL)
+                opener.open.assert_called_once()
+                self.assertEqual(opener.open.call_args.args[0].full_url, SITE_URL)
 
 
 class RunnerCommandTests(unittest.TestCase):
@@ -475,6 +514,7 @@ class SeedTests(unittest.TestCase):
         after = self.seed(self.files)
         self.assertEqual(self.git('rev-parse', f'{after}^').strip(), before)
         self.assertEqual(self.git('diff', '--name-only', before, after).splitlines(), [WORKFLOW])
+        self.assertEqual(self.git('show', 'main:README.md'), 'Keep\n')
         self.assertEqual(self.git('show', 'main:site/index.html'), '<h1>Existing</h1>\n')
         with self.assertRaises(FactoryError):
             self.seed({WORKFLOW: 'different workflow\n'})
@@ -557,8 +597,9 @@ class StarterFileTests(unittest.TestCase):
         (self.templates / 'README.md').write_text('__SITE_NAME__ __SITE_URL__')
         site = Mock(name='unused')
         site.name = '__SITE_URL__'
+        site.default_pages_url = 'https://gh.mamachanko.com/__SITE_URL__/'
         self.assertEqual(starter_files(site)['README.md'],
-                         '__SITE_URL__ https://mamachanko.github.io/__SITE_URL__/')
+                         '__SITE_URL__ https://gh.mamachanko.com/__SITE_URL__/')
 
     def test_rejects_symlinks_and_git_internal_paths(self):
         for path in ('linked', '.git/config'):

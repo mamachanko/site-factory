@@ -17,6 +17,7 @@ import urllib.request
 
 OWNER = "mamachanko"
 DOMAINS = ("mamachanko.com", "maxbrauer.com")
+DEFAULT_PAGES_HOST = "gh.mamachanko.com"
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ".github/workflows/deploy.yml"
 RULESET_NAME = "site-factory-main"
@@ -47,6 +48,8 @@ class APIError(FactoryError):
 
 
 def validate_domain(domain):
+    if not isinstance(domain, str):
+        raise FactoryError("Domain must be a lowercase DNS hostname, without scheme, port, path, or wildcard.")
     labels = domain.split(".")
     if len(domain) > 253 or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", x) for x in labels):
         raise FactoryError("Domain must be a lowercase DNS hostname, without scheme, port, path, or wildcard.")
@@ -67,6 +70,10 @@ class Site:
     @property
     def repository(self):
         return f"{OWNER}/{self.name}"
+
+    @property
+    def default_pages_url(self):
+        return f"https://{DEFAULT_PAGES_HOST}/{self.name}/"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -132,12 +139,12 @@ def installation_repository(api, site):
     return repositories[0]["id"]
 
 
-def starter_files(site):
+def starter_files(site, pages_url=None):
     directory = ROOT / "templates"
     if directory.is_symlink() or not directory.is_dir():
         raise FactoryError("Starter templates must be a regular directory.")
     files = {}
-    replacements = {"__SITE_NAME__": site.name, "__SITE_URL__": f"https://{OWNER}.github.io/{site.name}/"}
+    replacements = {"__SITE_NAME__": site.name, "__SITE_URL__": pages_url or site.default_pages_url}
     for source in sorted(directory.rglob("*")):
         path = source.relative_to(directory).as_posix()
         validate_starter_path(path)
@@ -259,20 +266,20 @@ def validate_pages_url(value):
         validate_domain(parts.hostname)
 
 
-def configured_pages_url(api, base):
+def configured_pages_url(api, site):
     try:
-        pages = api.request("GET", base + "/pages")
+        pages = api.request("GET", f"/repos/{site.repository}/pages")
     except APIError as error:
         if error.status == 404:
             return None
         raise
     if pages.get("build_type") != "workflow":
         raise FactoryError("Existing Pages must already use GitHub Actions; refusing to replace its source.")
-    if pages.get("cname"):
-        validate_domain(pages["cname"])
-    url = pages.get("html_url")
-    validate_pages_url(url)
-    return url
+    cname = pages.get("cname")
+    if cname is None or cname == DEFAULT_PAGES_HOST:
+        return site.default_pages_url
+    validate_domain(cname)
+    return f"https://{cname}/"
 
 
 def seed_repository(site, files, token, *, remote=None, check=lambda: None, require_main_only=False):
@@ -410,10 +417,10 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=pa
     base = f"/repos/{site.repository}"
     repo = target_repository(api, site, repository_id, require_main=False)
     needs_main = repo.get("default_branch") != "main"
-    pages_url = configured_pages_url(api, base)
+    pages_url = configured_pages_url(api, site)
     rule = existing_ruleset(api, base)
     integrity_rule = existing_ruleset(api, base, INTEGRITY_RULESET_NAME)
-    head = seed(site, starter_files(site), token,
+    head = seed(site, starter_files(site, pages_url), token,
                 check=lambda: target_repository(api, site, repository_id, require_main=not needs_main),
                 require_main_only=needs_main)
     progress("Starter files ready on main")
@@ -422,7 +429,7 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=pa
     if pages_url is None:
         target_repository(api, site, repository_id)
         api.request("POST", base + "/pages", {"build_type": "workflow"})
-        pages_url = configured_pages_url(api, base)
+        pages_url = configured_pages_url(api, site)
         if pages_url is None:
             raise FactoryError("Pages creation was not confirmed.")
     progress("GitHub Actions Pages confirmed")
@@ -464,7 +471,7 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=pa
     ensure_ruleset(api, site, repository_id, rule, RULESET_NAME)
     progress("Main requires pull requests, rebase merges, and the GitHub Actions Check site check; only admins bypass")
     for attempt in range(60):
-        pages_url = configured_pages_url(api, base)
+        pages_url = configured_pages_url(api, site)
         if pages_url is not None and live(pages_url):
             return pages_url, run_url
         if attempt != 59:

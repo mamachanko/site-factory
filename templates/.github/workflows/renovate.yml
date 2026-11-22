@@ -1,0 +1,32 @@
+name: Renovate
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+jobs:
+  renovate:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check out the exact public commit without credentials
+        shell: bash
+        run: |
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+          git -c core.hooksPath=/dev/null init .
+          git -c credential.helper= -c http.extraheader= -c core.hooksPath=/dev/null fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Open dependency update pull requests
+        uses: ./.github/actions/renovate
+        with:
+          token: ${{ github.token }}

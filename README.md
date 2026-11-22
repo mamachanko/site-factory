@@ -8,9 +8,15 @@ Set up the factory's [GitHub App](#one-time-github-app-setup) before your first 
 2. Open **site-factory → Actions → Workflows → Furnish site**. Tap **Run workflow**, enter the repository name, and submit. [Open Furnish site in your browser](https://github.com/mamachanko/site-factory/actions/workflows/furnish-site.yml).
 3. Open the finished run and give Codex the repository link from the summary. Ask Codex to build in `site/` and open a pull request. Merging to `main` deploys the update at the Pages link in the summary.
 
-Furnish site adds `site/index.html` and `.github/workflows/deploy.yml` where missing, enables GitHub Pages, and protects `main`. You can merge your own pull requests. The ruleset blocks branch deletion and force pushes.
+Furnish site adds a starter page, README, `AGENTS.md`, and workflows for checks, Pages, and Renovate. Existing README and `AGENTS.md` files stay in place.
 
-If setup stops, check the failed step and rerun Furnish site after fixing the problem. An existing deployment workflow must match the factory template. An existing Pages site must already use GitHub Actions as its source.
+Pull requests use rebase merges. **Check site** is required, and you can merge your own PRs. Repository administrators can push directly to `main` or bypass PR checks. Every deployment waits for **Check site**. Separate branch rules prevent force pushes and deletion of `main`.
+
+Issues stay on. Wiki, Projects, and Discussions are off. GitHub deletes merged branches.
+
+Renovate runs daily and on demand in each site repo. It opens PRs for npm dependencies and GitHub Action pins in local composite actions. Approve the workflow run on a Renovate PR to start its checks, then merge when green. [GitHub workflow approval](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow)
+
+Furnish site applies these defaults to newly furnished repositories. If initial setup stops, open the failed step and rerun after fixing the problem. Existing Pages must already use GitHub Actions as its source.
 
 ## One-time GitHub App setup
 
@@ -33,7 +39,7 @@ To give one project a different hostname, verify the domain on GitHub, then conf
 
 ## Develop site-factory
 
-The factory runs `scripts/factory.py` on GitHub Actions. It copies the two files in `templates/` into each site repository. Each site's deployment workflow publishes `site/` with its own `GITHUB_TOKEN`.
+The factory runs `scripts/factory.py` on GitHub Actions. The files in `templates/` mirror their paths in each site repository. Each site's deployment workflow publishes `site/` with its own `GITHUB_TOKEN`.
 
 Use Python 3.12+, Git, and GitHub CLI to work on the factory. Tests use mocked GitHub responses and local bare Git repositories.
 
@@ -42,7 +48,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install -r requirements-dev.txt
 python3 -m unittest discover -s tests -v
-actionlint .github/workflows/*.yml templates/deploy.yml
+actionlint .github/workflows/*.yml templates/.github/workflows/*.yml
 ```
 
 The workflows pin actions to full upstream commit SHAs. The comments identify the major versions.

@@ -2,7 +2,6 @@
 """Validate or furnish an owner-created repository from the trusted App workflow."""
 import argparse
 from dataclasses import dataclass
-import html
 import http.client
 import json
 import os
@@ -21,6 +20,14 @@ DOMAINS = ("mamachanko.com", "maxbrauer.com")
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ".github/workflows/deploy.yml"
 RULESET_NAME = "site-factory-main"
+INTEGRITY_RULESET_NAME = "site-factory-main-integrity"
+REPOSITORY_DEFAULTS = {
+    "allow_merge_commit": False, "allow_squash_merge": False, "allow_rebase_merge": True,
+    "allow_auto_merge": False, "delete_branch_on_merge": True,
+    "has_issues": True, "has_wiki": False, "has_projects": False, "has_discussions": False,
+    "default_branch": "main",
+}
+WORKFLOW_PERMISSIONS = {"default_workflow_permissions": "read", "can_approve_pull_request_reviews": True}
 SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -127,8 +134,32 @@ def installation_repository(api, site):
 
 def starter_files(site):
     directory = ROOT / "templates"
-    return {"site/index.html": (directory / "index.html").read_text().replace("__SITE_NAME__", html.escape(site.name)),
-            WORKFLOW: (directory / "deploy.yml").read_text()}
+    if directory.is_symlink() or not directory.is_dir():
+        raise FactoryError("Starter templates must be a regular directory.")
+    files = {}
+    replacements = {"__SITE_NAME__": site.name, "__SITE_URL__": f"https://{OWNER}.github.io/{site.name}/"}
+    for source in sorted(directory.rglob("*")):
+        path = source.relative_to(directory).as_posix()
+        validate_starter_path(path)
+        if source.is_symlink() or not (source.is_dir() or source.is_file()):
+            raise FactoryError(f"Template {path} must be a regular file or directory.")
+        if source.is_file():
+            content = source.read_bytes().decode("utf-8")
+            files[path] = re.sub(r"__SITE_NAME__|__SITE_URL__", lambda match: replacements[match[0]], content)
+    if WORKFLOW not in files or "site/index.html" not in files:
+        raise FactoryError("Starter templates must include the deployment workflow and site/index.html.")
+    return files
+
+
+def validate_starter_path(path):
+    if (not isinstance(path, str) or not path or path.startswith("/") or "\\" in path
+            or any(ord(char) < 32 or ord(char) == 127 for char in path)
+            or any(piece in ("", ".", "..") or piece.casefold() == ".git" for piece in path.split("/"))):
+        raise FactoryError("Starter paths must be safe relative repository paths.")
+
+
+def owned_automation(path):
+    return path == ".github" or path.startswith(".github/") or path == "renovate.json"
 
 
 def target_repository(api, site, repository_id, *, require_main=True):
@@ -145,33 +176,47 @@ def target_repository(api, site, repository_id, *, require_main=True):
     return repo
 
 
-def ruleset_payload():
-    return {"name": RULESET_NAME, "target": "branch", "enforcement": "active", "bypass_actors": [],
+def ruleset_payload(name=RULESET_NAME):
+    common = {"name": name, "target": "branch", "enforcement": "active", "bypass_actors": [],
             "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
-            "rules": [{"type": "deletion"}, {"type": "non_fast_forward"},
-                      {"type": "pull_request", "parameters": {
-                          "allowed_merge_methods": ["merge", "squash", "rebase"],
+            "rules": []}
+    if name == INTEGRITY_RULESET_NAME:
+        common["rules"] = [{"type": "deletion"}, {"type": "non_fast_forward"}, {"type": "required_linear_history"}]
+    elif name == RULESET_NAME:
+        common["bypass_actors"] = [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+        common["rules"] = [{"type": "pull_request", "parameters": {
+                          "allowed_merge_methods": ["rebase"],
                           "require_extra_approval_for_unattributed_changes": False,
                           "required_approving_review_count": 0, "dismiss_stale_reviews_on_push": False,
                           "require_code_owner_review": False, "require_last_push_approval": False,
-                          "required_review_thread_resolution": False}}]}
+                          "required_review_thread_resolution": False}},
+                          {"type": "required_status_checks", "parameters": {
+                              "required_status_checks": [{"context": "Check site", "integration_id": 15368}],
+                              "strict_required_status_checks_policy": False,
+                              "do_not_enforce_on_create": False}}]
+    else:
+        raise FactoryError("Unknown managed ruleset.")
+    return common
 
 
-def compatible_ruleset(value):
-    expected = ruleset_payload()
+def compatible_ruleset(value, name=RULESET_NAME):
+    if not isinstance(value, dict):
+        return False
+    expected = ruleset_payload(name)
     if any(value.get(key) != expected[key] for key in ("name", "target", "enforcement", "conditions", "bypass_actors")):
         return False
     rules = value.get("rules", [])
-    if len(rules) != len(expected["rules"]):
+    if not isinstance(rules, list) or len(rules) != len(expected["rules"]):
         return False
     for wanted in expected["rules"]:
-        matches = [rule for rule in rules if rule.get("type") == wanted["type"]]
+        matches = [rule for rule in rules if isinstance(rule, dict) and rule.get("type") == wanted["type"]]
         if len(matches) != 1:
             return False
         actual = matches[0].get("parameters", {})
         required = wanted.get("parameters", {})
-        if any((sorted(actual.get(key, [])) != sorted(val) if key == "allowed_merge_methods"
-                else actual.get(key) != val) for key, val in required.items()):
+        if not isinstance(actual, dict):
+            return False
+        if not matches_settings(actual, required):
             return False
         # GitHub can return empty optional parameters such as required_reviewers.
         if any(val not in (False, None, [], {}) for key, val in actual.items() if key not in required):
@@ -179,22 +224,27 @@ def compatible_ruleset(value):
     return True
 
 
-def existing_ruleset(api, base):
+def existing_ruleset(api, base, name=RULESET_NAME):
     found = []
     for page in range(1, 101):
         items = api.request("GET", f"{base}/rulesets?includes_parents=false&per_page=100&page={page}")
-        found.extend(item for item in items if item.get("name") == RULESET_NAME)
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise FactoryError("GitHub returned an invalid ruleset list.")
+        found.extend(item for item in items if item.get("name") == name)
         if len(items) < 100:
             break
     else:
         raise FactoryError("Too many rulesets to safely inspect.")
     if len(found) > 1:
-        raise FactoryError("Multiple site-factory-main rulesets exist; inspect before continuing.")
+        raise FactoryError(f"Multiple {name} rulesets exist; inspect before continuing.")
     if not found:
         return None
-    rule = api.request("GET", f"{base}/rulesets/{found[0]['id']}")
-    if not compatible_ruleset(rule):
-        raise FactoryError("Existing site-factory-main ruleset is incompatible; nothing will overwrite it.")
+    rule_id = found[0].get("id")
+    if type(rule_id) is not int or rule_id <= 0:
+        raise FactoryError("GitHub returned an invalid managed ruleset ID.")
+    rule = api.request("GET", f"{base}/rulesets/{rule_id}")
+    if not compatible_ruleset(rule, name):
+        raise FactoryError(f"Existing {name} ruleset is incompatible; nothing will overwrite it.")
     return rule
 
 
@@ -227,6 +277,8 @@ def configured_pages_url(api, base):
 
 def seed_repository(site, files, token, *, remote=None, check=lambda: None, require_main_only=False):
     """Add missing blobs using a temporary Git index; never check out remote content."""
+    for path in files:
+        validate_starter_path(path)
     env = {key: val for key, val in os.environ.items() if not key.startswith(("GIT_", "GH_", "GITHUB_"))}
     env.update(GH_TOKEN=token, GH_HOST="github.com", GH_PROMPT_DISABLED="1", GIT_TERMINAL_PROMPT="0",
                GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
@@ -273,8 +325,8 @@ def seed_repository(site, files, token, *, remote=None, check=lambda: None, requ
                 mode, kind, blob = entries[path]
                 if mode not in (b"100644", b"100755") or kind != b"blob":
                     raise FactoryError(f"Existing {path} must be a regular file.")
-                if path == WORKFLOW and git("cat-file", "blob", blob.decode()) != content.encode():
-                    raise FactoryError("Existing deploy.yml is unknown; refusing to overwrite or dispatch it.")
+                if owned_automation(path) and git("cat-file", "blob", blob.decode()) != content.encode():
+                    raise FactoryError(f"Existing {path} is unknown; refusing to overwrite or dispatch automation.")
                 continue
             if any(existing.startswith(path + "/") for existing in entries):
                 raise FactoryError(f"A directory blocks starter path {path}.")
@@ -315,6 +367,44 @@ def page_responds(url):
     raise FactoryError("Pages redirected too many times.")
 
 
+def matches_settings(actual, desired):
+    return (isinstance(actual, dict)
+            and all(type(actual.get(key)) is type(value) and actual[key] == value for key, value in desired.items()))
+
+
+def configure_defaults(api, site, repository_id):
+    base = f"/repos/{site.repository}"
+    repo = target_repository(api, site, repository_id, require_main=False)
+    changes = {key: value for key, value in REPOSITORY_DEFAULTS.items()
+               if not matches_settings(repo, {key: value})}
+    if changes:
+        target_repository(api, site, repository_id, require_main=False)
+        api.request("PATCH", base, changes)
+    if not matches_settings(target_repository(api, site, repository_id), REPOSITORY_DEFAULTS):
+        raise FactoryError("Repository defaults were not confirmed; inspect GitHub settings.")
+    path = base + "/actions/permissions/workflow"
+    permissions = api.request("GET", path)
+    if not matches_settings(permissions, WORKFLOW_PERMISSIONS):
+        target_repository(api, site, repository_id)
+        api.request("PUT", path, WORKFLOW_PERMISSIONS)
+        if not matches_settings(api.request("GET", path), WORKFLOW_PERMISSIONS):
+            raise FactoryError("Workflow token permissions were not confirmed; inspect GitHub settings.")
+
+
+def ensure_ruleset(api, site, repository_id, existing, name):
+    if existing is not None:
+        return
+    base = f"/repos/{site.repository}"
+    target_repository(api, site, repository_id)
+    created = api.request("POST", base + "/rulesets", ruleset_payload(name))
+    rule_id = created.get("id") if isinstance(created, dict) else None
+    if type(rule_id) is not int or rule_id <= 0:
+        raise FactoryError(f"Created {name} ruleset returned no ID; inspect GitHub.")
+    readback = api.request("GET", f"{base}/rulesets/{rule_id}")
+    if not compatible_ruleset(readback, name):
+        raise FactoryError(f"Created {name} ruleset was not confirmed; inspect GitHub.")
+
+
 def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=page_responds, progress=lambda message: None):
     repository_id = installation_repository(api, site)
     base = f"/repos/{site.repository}"
@@ -322,14 +412,13 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=pa
     needs_main = repo.get("default_branch") != "main"
     pages_url = configured_pages_url(api, base)
     rule = existing_ruleset(api, base)
+    integrity_rule = existing_ruleset(api, base, INTEGRITY_RULESET_NAME)
     head = seed(site, starter_files(site), token,
                 check=lambda: target_repository(api, site, repository_id, require_main=not needs_main),
                 require_main_only=needs_main)
     progress("Starter files ready on main")
-    repo = target_repository(api, site, repository_id, require_main=not needs_main)
-    if repo.get("default_branch") != "main":
-        api.request("PATCH", base, {"default_branch": "main"})
-        target_repository(api, site, repository_id)
+    configure_defaults(api, site, repository_id)
+    progress("Repository settings and workflow token permissions confirmed")
     if pages_url is None:
         target_repository(api, site, repository_id)
         api.request("POST", base + "/pages", {"build_type": "workflow"})
@@ -337,12 +426,8 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=pa
         if pages_url is None:
             raise FactoryError("Pages creation was not confirmed.")
     progress("GitHub Actions Pages confirmed")
-    if rule is None:
-        target_repository(api, site, repository_id)
-        created = api.request("POST", base + "/rulesets", ruleset_payload())
-        if not compatible_ruleset(created):
-            raise FactoryError("Created main ruleset was not confirmed; inspect GitHub.")
-    progress("Main requires pull requests, with no required reviewers; deletion and force pushes blocked")
+    ensure_ruleset(api, site, repository_id, integrity_rule, INTEGRITY_RULESET_NAME)
+    progress("Main deletion, force pushes, and merge commits blocked without bypass")
     workflow_path = base + "/actions/workflows/deploy.yml"
     for attempt in range(8):
         try:
@@ -375,6 +460,9 @@ def furnish(api, site, token, *, seed=seed_repository, sleep=time.sleep, live=pa
         if attempt == 119:
             raise FactoryError(f"Deployment is still pending; inspect {run_url}.")
         sleep(5)
+    # GitHub expects the check source to have recently reported a check run.
+    ensure_ruleset(api, site, repository_id, rule, RULESET_NAME)
+    progress("Main requires pull requests, rebase merges, and the GitHub Actions Check site check; only admins bypass")
     for attempt in range(60):
         pages_url = configured_pages_url(api, base)
         if pages_url is not None and live(pages_url):
